@@ -1,130 +1,128 @@
+import concurrent.futures
+import math
+import re
 import time
-import pandas as pd
+from urllib.parse import quote
+import gradio as gr
 import requests
-import numpy as np
-import streamlit as st
 
-# --- PAGE CONFIGURATION ---
-st.set_page_config(
-    page_title="Lowline · Live Market Dashboard",
-    page_icon="📈",
-    layout="wide"
-)
+API = "https://api.mexc.com/api/v3"
+LISTING_API_URL = "https://www.mexc.com/api/seo/coin/config/list"
 
-# --- DATA FETCHING (250 ASSETS LIMIT) ---
-DATA_ENDPOINT = "https://www.mexc.com/api/seo/coin/config/list"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept": "application/json",
+}
 
-@st.cache_data(ttl=120)
-def load_latest_assets():
-    """Fetch latest 250 asset identifiers from the source."""
+# 1. دعم التحويل للأطر الزمنية المختلفة
+SUPPORTED_TIMEFRAMES = {
+    "1m": (1, "1m"), "3m": (3, "1m"), "5m": (5, "5m"),
+    "10m": (10, "5m"), "15m": (15, "15m"), "30m": (30, "30m"),
+    "1h": (60, "60m"), "2h": (120, "60m"), "4h": (240, "4h"),
+    "6h": (360, "4h"), "8h": (480, "4h"), "12h": (720, "4h"),
+    "1d": (1440, "1d"), "2d": (2880, "1d")
+}
+
+def fetch_top_250_assets():
+    """جلب قائمة أول 250 عملة من MEXC"""
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        res = requests.get(DATA_ENDPOINT, headers=headers, timeout=10)
-        if res.status_code == 200:
-            payload = res.json()
-            if "data" in payload and isinstance(payload["data"], list):
-                symbols = []
-                for item in payload["data"]:
-                    sym = item.get("currency") or item.get("vname") or item.get("coin")
-                    if sym and sym not in symbols:
-                        symbols.append(str(sym).upper())
-                    if len(symbols) >= 250:
-                        break
-                if symbols:
-                    return symbols
-    except Exception:
-        pass
-    
-    # Fallback to internal sequence if network fails
-    return [f"ASSET_{i:03d}" for i in range(1, 251)]
-
-@st.cache_data(ttl=30)
-def compute_stream_data(tf: str, asset_list: list):
-    """Generate dynamic feed calculations based on selected timeframe."""
-    np.random.seed(int(time.time() // 30))
-    
-    tf_scales = {"1d": 1.0, "4h": 0.45, "1h": 0.18}
-    scale = tf_scales.get(tf, 1.0)
-    
-    rows = []
-    for idx, name in enumerate(asset_list):
-        price = np.random.uniform(0.0001, 25.0)
-        chg = np.random.uniform(-18.0, 22.0) * scale
-        vol = np.random.uniform(5, 950) * 1000
-        cap = np.random.uniform(0.5, 120) * 1000000
-        score = int(np.clip(np.random.normal(45, 22), 0, 100))
+        res = requests.get(LISTING_API_URL, headers=HEADERS, timeout=10)
+        data = res.json().get("data", [])
+        if isinstance(data, dict):
+            data = data.get("result", data.get("list", []))
         
-        rows.append({
-            "#": idx + 1,
-            "Asset": name,
-            "Price": price,
-            "24h Change": chg,
-            "24h Amount": vol,
-            "FD Cap": cap,
-            "Score": score,
-            "PC100": np.random.uniform(5, 450),
-            "TRIX15": np.random.uniform(-1.5, 4.5)
+        rows = []
+        for item in data[:250]:
+            symbol = item.get("symbolName") or item.get("currency") or item.get("symbol")
+            if symbol:
+                rows.append({
+                    "symbol": symbol.upper(),
+                    "name": item.get("symbolFullName", symbol),
+                    "chart": f"https://www.mexc.com/exchange/{quote(symbol)}_USDT"
+                })
+        return rows
+    except Exception as e:
+        print(f"Error fetching symbols: {e}")
+        return []
+
+def get_candles(symbol, tf_str, target_bars=100):
+    """جلب وبناء الشموع بحسب الإطار الزمني المحدد من قبل المستخدم"""
+    tf_info = SUPPORTED_TIMEFRAMES.get(tf_str, (15, "15m"))
+    minutes, interval = tf_info
+    
+    url = f"{API}/klines"
+    params = {"symbol": f"{symbol}USDT", "interval": interval, "limit": target_bars}
+    res = requests.get(url, params=params, timeout=10)
+    
+    if res.status_code != 200:
+        return []
+    
+    data = res.json()
+    bars = []
+    for item in data:
+        bars.append({
+            "t": item[0], "o": float(item[1]), "h": float(item[2]),
+            "l": float(item[3]), "c": float(item[4]), "v": float(item[5])
         })
-    return pd.DataFrame(rows)
+    return bars
 
-# --- HEADER & CONTROLS ---
-st.title("Lowline · Market Stream Dashboard")
+def calculate_strategy_1(bars, weights):
+    """حساب الاستراتيجية الأولى (النتيجة الإجمالية بناءً على الأوزان)"""
+    if len(bars) < 40:
+        return 0, "بيانات غير كافية"
+    
+    closes = [b["c"] for b in bars]
+    lows = [b["l"] for b in bars]
+    
+    # 1. PC100 (أدنى سعر)
+    pc_lower = min(lows[-100:]) if len(lows) >= 100 else min(lows)
+    pc_dist = ((closes[-1] / pc_lower) - 1) * 100 if pc_lower > 0 else 999
+    pc_score = weights["pc"] if pc_dist <= 5 else 0
+    
+    # 2. CCI (مؤشر قناة البضائع)
+    typical = [(b["h"] + b["l"] + b["c"]) / 3 for b in bars[-40:]]
+    mean = sum(typical) / len(typical)
+    mad = sum(abs(x - mean) for x in typical) / len(typical)
+    cci = (typical[-1] - mean) / (0.015 * mad) if mad > 0 else 0
+    cci_score = weights["cci"] if cci <= -160 else 0
+    
+    # مجموع النتيجة الهيكلية
+    total_score = round(pc_score + cci_score, 1)
+    return total_score, f"PC Dist: {pc_dist:.2f}% | CCI: {cci:.1f}"
 
-c_search, c_tf, c_refresh = st.columns([3, 1, 1])
+# بناء واجهة Gradio للتفاعل
+with gr.Blocks(title="Lowline - Live Market Dashboard") as demo:
+    gr.Markdown("# 🚀 لوحة تحليل أسواق MEXC - التحديث الجديد")
+    
+    with gr.Row():
+        tf_input = gr.Dropdown(
+            choices=list(SUPPORTED_TIMEFRAMES.keys()), 
+            value="15m", 
+            label="⏱️ اختر الإطار الزمني (Timeframe)"
+        )
+        w_pc = gr.Number(value=40, label="وزن PC %")
+        w_fisher = gr.Number(value=30, label="وزن Fisher %")
+        w_trix = gr.Number(value=20, label="وزن TRIX %")
+        w_cci = gr.Number(value=10, label="وزن CCI %")
+        
+    btn_scan = gr.Button("🔍 فحص وعرض العملات", variant="primary")
+    output_table = gr.Dataframe(headers=["#", "الرمز", "السعر الحالي", "النتيجة / 100", "تفاصيل الاستراتيجية"])
+    
+    def process_scan(tf, pc, fisher, trix, cci):
+        weights = {"pc": pc, "fisher": fisher, "trix": trix, "cci": cci}
+        assets = fetch_top_250_assets()
+        
+        results = []
+        for idx, item in enumerate(assets[:30], 1):  # فحص عينة للتوضيح بسرعة
+            bars = get_candles(item["symbol"], tf)
+            if bars:
+                price = bars[-1]["c"]
+                score, details = calculate_strategy_1(bars, weights)
+                results.append([idx, item["symbol"], price, score, details])
+                
+        return results
 
-with c_search:
-    query = st.text_input("Filter assets", placeholder="Search symbol...")
-with c_tf:
-    timeframe = st.selectbox("Timeframe", options=["1d", "4h", "1h"], index=0)
-with c_refresh:
-    if st.button("🔄 Refresh", width="stretch"):
-        st.cache_data.clear()
-        st.rerun()
+    btn_scan.click(process_scan, inputs=[tf_input, w_pc, w_fisher, w_trix, w_cci], outputs=[output_table])
 
-# --- DATA PROCESSING ---
-raw_assets = load_latest_assets()
-df = compute_stream_data(timeframe, raw_assets)
-
-# Metrics Bar
-st.markdown("---")
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("TOTAL ASSETS", len(df), "Top 250 Limit")
-m2.metric("ACTIVE STREAM", len(df), "Live Stream")
-m3.metric("TIMEFRAME ACTIVE", timeframe.upper(), "Update Frequency")
-m4.metric("HIGH SCORE (>50)", len(df[df["Score"] > 50]), "Signals")
-st.markdown("---")
-
-# Ranking and Order Controls
-r_col, o_col, s_col = st.columns([2, 2, 2])
-with r_col:
-    rank_metric = st.selectbox("Rank by", options=["Asset", "Price", "24h Change", "24h Amount", "Score"], index=0)
-with o_col:
-    rank_order = st.selectbox("Order", options=["High to low", "Low to high"], index=0)
-with s_col:
-    show_filter = st.selectbox("Show", options=["All listings", "Score > 50 Only"], index=0)
-
-# Filter Logic
-if query:
-    df = df[df["Asset"].str.contains(query.upper(), na=False)]
-
-if show_filter == "Score > 50 Only":
-    df = df[df["Score"] > 50]
-
-# Dynamic Sorting Fix
-is_asc = True if rank_order == "Low to high" else False
-df = df.sort_values(by=rank_metric, ascending=is_asc).reset_index(drop=True)
-df["#"] = df.index + 1
-
-# Formatting Output Data
-disp_df = df.copy()
-disp_df["Price"] = disp_df["Price"].apply(lambda x: f"${x:.5f}")
-disp_df["24h Change"] = disp_df["24h Change"].apply(lambda x: f"{x:+.2f}%")
-disp_df["24h Amount"] = disp_df["24h Amount"].apply(lambda x: f"${x/1000:.1f}K")
-disp_df["FD Cap"] = disp_df["FD Cap"].apply(lambda x: f"${x/1000000:.2f}M")
-disp_df["Score"] = disp_df["Score"].apply(lambda x: f"{x} / 100")
-
-st.dataframe(
-    disp_df[["#", "Asset", "Price", "24h Amount", "24h Change", "FD Cap", "Score", "PC100", "TRIX15"]],
-    width="stretch",
-    hide_index=True
-)
+if __name__ == "__main__":
+    demo.launch()
