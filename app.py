@@ -14,7 +14,7 @@ st.set_page_config(
 
 # --- SECURITY & AUTHENTICATION ---
 # Pre-computed SHA-256 Hash for the access key
-PASS_HASH = "8142718d0bb4e339c9fbd8168bb1d86d2bbbfefd4c423d24e12270dd962b7be8"
+PASS_HASH = "8c353c7c1ffc8e7e178a9c4be46313364f9b88235e297a7eb845f8f85f54aa2f"
 
 def verify_access_key(key_input: str) -> bool:
     """Verifies SHA-256 hash against stored digest without storing raw text."""
