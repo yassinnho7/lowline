@@ -10,53 +10,72 @@ st.set_page_config(page_title="Lowline Analytics Dashboard", layout="wide")
 LISTING_API = "https://www.mexc.com/api/seo/coin/config/list"
 KLINES_API = "https://api.mexc.com/api/v3/klines"
 
-# Setup Session with standard browser headers to avoid API blocks
+# Setup Session with complete browser spoofing headers to bypass Cloudflare
 session = requests.Session()
 session.headers.update(
     {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
         "Origin": "https://www.mexc.com",
-        "Referer": "https://www.mexc.com/",
+        "Referer": "https://www.mexc.com/price/new-crypto",
+        "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
     }
 )
 
 
 def fetch_seo_listing_assets():
-    """Strictly fetch top 250 assets from the provided SEO Coin Config endpoint."""
+    """Fetch top 250 assets directly from SEO endpoint following exact listing order."""
     try:
-        res = session.get(LISTING_API, timeout=10)
+        res = session.get(LISTING_API, timeout=12)
         if res.status_code != 200:
+            st.error(f"HTTP Error {res.status_code} while fetching asset list.")
             return []
 
         res_json = res.json()
         data = res_json.get("data", [])
+
+        # Handle nested data structure variations
         if isinstance(data, dict):
-            data = data.get("result", data.get("list", []))
+            data = data.get("result") or data.get("list") or []
 
         rows = []
         for idx, item in enumerate(data[:250], 1):
-            symbol = item.get("symbolName") or item.get("currency") or item.get("symbol")
+            symbol_name = (
+                item.get("symbolName") or item.get("currency") or item.get("symbol")
+            )
+            full_name = item.get("symbolFullName") or symbol_name
+
+            # Check for hidden status or disabled fetching
             is_hidden = (
                 item.get("hide", False)
                 or item.get("state") == "HIDE"
                 or not item.get("enableFetch", True)
             )
 
-            if symbol:
-                sym_upper = symbol.upper().replace("_USDT", "").replace("USDT", "")
+            if symbol_name:
+                sym_clean = str(symbol_name).strip().upper()
+                chart_url = f"https://www.mexc.com/exchange/{quote(sym_clean)}_USDT"
+
                 rows.append(
                     {
                         "listing_rank": idx,
-                        "symbol": sym_upper,
+                        "symbol": sym_clean,
+                        "full_name": full_name,
                         "is_hidden": is_hidden,
-                        "chart": f"https://www.mexc.com/exchange/{quote(sym_upper)}_USDT",
+                        "chart": chart_url,
                     }
                 )
         return rows
     except Exception as e:
-        st.error(f"Error reading listing endpoint: {e}")
+        st.error(f"Error fetching SEO list: {e}")
         return []
 
 
@@ -90,7 +109,7 @@ def get_candles(symbol, tf_str, target_bars=150):
 
 # --- STRATEGY 1 CALCULATION ---
 def calc_strategy_1(bars, w_pc, w_fisher, w_trix, w_cci):
-    if not bars or len(bars) < 100:
+    if not bars or len(bars) < 40:
         return 0.0, 0.0, "N/A"
 
     closes = np.array([b["c"] for b in bars])
@@ -98,14 +117,16 @@ def calc_strategy_1(bars, w_pc, w_fisher, w_trix, w_cci):
     highs = np.array([b["h"] for b in bars])
 
     # 1. PC Distance
-    pc_lower = np.min(lows[-100:])
+    lookback_pc = min(100, len(lows))
+    pc_lower = np.min(lows[-lookback_pc:])
     pc_dist = ((closes[-1] / pc_lower) - 1.0) * 100.0 if pc_lower > 0 else 999.0
     s_pc = w_pc if pc_dist <= 5.0 else 0.0
 
-    # 2. Fisher Transform (70)
-    hl2 = (highs[-70:] + lows[-70:]) / 2.0
-    min_l = np.min(lows[-70:])
-    max_h = np.max(highs[-70:])
+    # 2. Fisher Transform
+    lookback_fish = min(70, len(lows))
+    hl2 = (highs[-lookback_fish:] + lows[-lookback_fish:]) / 2.0
+    min_l = np.min(lows[-lookback_fish:])
+    max_h = np.max(highs[-lookback_fish:])
     raw_val = (hl2[-1] - min_l) / (max_h - min_l) if (max_h - min_l) > 0 else 0.5
     val = max(min(0.66 * (raw_val - 0.5) + 0.5 * 0.5, 0.999), -0.999)
     fisher = 0.5 * np.log((1.0 + val) / (1.0 - val))
@@ -127,7 +148,10 @@ def calc_strategy_1(bars, w_pc, w_fisher, w_trix, w_cci):
     s_trix = w_trix if trix <= 0 else 0.0
 
     # 4. CCI (40)
-    tp = (highs[-40:] + lows[-40:] + closes[-40:]) / 3.0
+    lookback_cci = min(40, len(closes))
+    tp = (
+        highs[-lookback_cci:] + lows[-lookback_cci:] + closes[-lookback_cci:]
+    ) / 3.0
     sma_tp = np.mean(tp)
     mad = np.mean(np.abs(tp - sma_tp))
     cci = (tp[-1] - sma_tp) / (0.015 * mad) if mad > 0 else 0.0
@@ -140,7 +164,7 @@ def calc_strategy_1(bars, w_pc, w_fisher, w_trix, w_cci):
 
 # --- STRATEGY 2 CALCULATION (Pine Technical View) ---
 def calc_strategy_2(bars, pc_threshold, rsi_bottom_thresh):
-    if not bars or len(bars) < 130:
+    if not bars or len(bars) < 40:
         return 0.0, "N/A", "Insufficient Data"
 
     closes = np.array([b["c"] for b in bars])
@@ -148,25 +172,27 @@ def calc_strategy_2(bars, pc_threshold, rsi_bottom_thresh):
     highs = np.array([b["h"] for b in bars])
 
     # 1. PC130 Proximity
-    min_130 = np.min(lows[-130:])
+    lookback = min(130, len(lows))
+    min_130 = np.min(lows[-lookback:])
     pc130_dist = ((closes[-1] / min_130) - 1.0) * 100.0 if min_130 > 0 else 999.0
     pc_signal = pc130_dist <= pc_threshold
 
-    # 2. Adaptive Wave (ATR130 Channel)
+    # 2. Adaptive Wave
     tr = np.maximum(
         highs[1:] - lows[1:],
         np.maximum(np.abs(highs[1:] - closes[:-1]), np.abs(lows[1:] - closes[:-1])),
     )
-    atr130 = np.mean(tr[-130:]) if len(tr) >= 130 else np.mean(tr)
+    atr130 = np.mean(tr[-lookback:]) if len(tr) >= lookback else np.mean(tr)
     wave_bottom = min_130 + (atr130 * 0.5)
     wave_signal = closes[-1] <= wave_bottom
 
-    # 3. SmartPulse RSI Channel (RSI 70 on 85-bar Channel)
-    deltas = np.diff(closes[-85:])
+    # 3. SmartPulse RSI Channel
+    rsi_lookback = min(85, len(closes) - 1)
+    deltas = np.diff(closes[-rsi_lookback - 1 :])
     gains = np.where(deltas > 0, deltas, 0)
     losses = np.where(deltas < 0, -deltas, 0)
-    avg_gain = np.mean(gains)
-    avg_loss = np.mean(losses)
+    avg_gain = np.mean(gains) if len(gains) > 0 else 0
+    avg_loss = np.mean(losses) if len(losses) > 0 else 0
     rs = avg_gain / avg_loss if avg_loss > 0 else 100.0
     rsi = 100.0 - (100.0 / (1.0 + rs))
     rsi_signal = rsi <= rsi_bottom_thresh
@@ -189,7 +215,9 @@ st.title("Lowline Analytics Dashboard")
 
 # Global Configurations
 st.sidebar.header("Global Configurations")
-custom_tf = st.sidebar.text_input("Custom Timeframe (e.g., 1m, 5m, 15m, 1h, 4h, 1d):", value="15m")
+custom_tf = st.sidebar.text_input(
+    "Custom Timeframe (e.g., 1m, 5m, 15m, 1h, 4h, 1d):", value="15m"
+)
 
 sort_option = st.sidebar.selectbox(
     "Sort Results By:",
@@ -202,7 +230,9 @@ sort_option = st.sidebar.selectbox(
     ],
 )
 
-tab1, tab2 = st.tabs(["Strategy 1 (Quantitative Score)", "Strategy 2 (Pine Technical View)"])
+tab1, tab2 = st.tabs(
+    ["Strategy 1 (Quantitative Score)", "Strategy 2 (Pine Technical View)"]
+)
 
 # ----------------- TAB 1 -----------------
 with tab1:
@@ -218,27 +248,32 @@ with tab1:
         w_cci = st.number_input("CCI Weight %", value=10, key="s1_cci")
 
     if st.button("Run Strategy 1 Scan", type="primary"):
-        with st.spinner("Fetching top 250 assets directly from SEO endpoint..."):
+        with st.spinner(
+            "Fetching top 250 assets directly from SEO endpoint..."
+        ):
             assets = fetch_seo_listing_assets()
 
             if not assets:
-                st.error("No assets retrieved from SEO endpoint. Please check connection.")
+                st.error(
+                    "No assets retrieved from SEO endpoint. Please check connection."
+                )
             else:
                 results = []
 
                 def worker_s1(item):
                     symbol = item["symbol"]
+                    full_name = item["full_name"]
                     is_hidden = item["is_hidden"]
                     bars = get_candles(symbol, custom_tf)
 
                     if is_hidden or not bars:
-                        display_sym = f"⚠️ {symbol} [Hidden / No Data]"
+                        display_sym = f"⚠️ {symbol} ({full_name}) [Hidden / No Data]"
                         price_num = 0.0
                         price_str = "N/A"
                         score = 0.0
                         details = "Hidden asset / No market data"
                     else:
-                        display_sym = symbol
+                        display_sym = f"{symbol} ({full_name})"
                         price_num, score, details = calc_strategy_1(
                             bars, w_pc, w_fisher, w_trix, w_cci
                         )
@@ -251,11 +286,15 @@ with tab1:
                         "_raw_price": price_num,
                         "Setup Score / 100": score,
                         "Indicator Details": details,
-                        "Chart": item["chart"],
+                        "Chart Link": item["chart"],
                     }
 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
-                    futures = [executor.submit(worker_s1, item) for item in assets]
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=10
+                ) as executor:
+                    futures = [
+                        executor.submit(worker_s1, item) for item in assets
+                    ]
                     for future in concurrent.futures.as_completed(futures):
                         results.append(future.result())
 
@@ -263,7 +302,9 @@ with tab1:
                 if sort_option == "Listing Sequence (Default)":
                     results.sort(key=lambda x: x["#"])
                 elif sort_option == "Strategy Score / Signal Status":
-                    results.sort(key=lambda x: x["Setup Score / 100"], reverse=True)
+                    results.sort(
+                        key=lambda x: x["Setup Score / 100"], reverse=True
+                    )
                 elif sort_option == "Price (High to Low)":
                     results.sort(key=lambda x: x["_raw_price"], reverse=True)
                 elif sort_option == "Price (Low to High)":
@@ -271,45 +312,63 @@ with tab1:
                 elif sort_option == "Symbol Name (A-Z)":
                     results.sort(key=lambda x: x["Symbol"])
 
-                # Remove internal raw field before displaying
                 for r in results:
                     del r["_raw_price"]
 
-                st.success(f"Successfully processed {len(results)} assets strictly from SEO config list!")
-                st.dataframe(results, use_container_width=True)
+                st.success(
+                    f"Successfully processed {len(results)} assets directly from SEO config list!"
+                )
+                st.dataframe(
+                    results,
+                    use_container_width=True,
+                    column_config={"Chart Link": st.column_config.LinkColumn()},
+                )
 
 # ----------------- TAB 2 -----------------
 with tab2:
-    st.subheader("Strategy 2 - PC130 Proximity + Adaptive Wave + RSI Channel Bottom")
+    st.subheader(
+        "Strategy 2 - PC130 Proximity + Adaptive Wave + RSI Channel Bottom"
+    )
     col1, col2 = st.columns(2)
     with col1:
-        pc_thresh = st.number_input("PC130 Proximity Threshold (%)", value=3.0, key="s2_pc")
+        pc_thresh = st.number_input(
+            "PC130 Proximity Threshold (%)", value=3.0, key="s2_pc"
+        )
     with col2:
-        rsi_bottom = st.number_input("RSI Channel Bottom Threshold", value=30.0, key="s2_rsi")
+        rsi_bottom = st.number_input(
+            "RSI Channel Bottom Threshold", value=30.0, key="s2_rsi"
+        )
 
     if st.button("Run Strategy 2 Scan", type="primary"):
-        with st.spinner("Fetching top 250 assets directly from SEO endpoint..."):
+        with st.spinner(
+            "Fetching top 250 assets directly from SEO endpoint..."
+        ):
             assets = fetch_seo_listing_assets()
 
             if not assets:
-                st.error("No assets retrieved from SEO endpoint. Please check connection.")
+                st.error(
+                    "No assets retrieved from SEO endpoint. Please check connection."
+                )
             else:
                 results = []
 
                 def worker_s2(item):
                     symbol = item["symbol"]
+                    full_name = item["full_name"]
                     is_hidden = item["is_hidden"]
                     bars = get_candles(symbol, custom_tf)
 
                     if is_hidden or not bars:
-                        display_sym = f"⚠️ {symbol} [Hidden / No Data]"
+                        display_sym = f"⚠️ {symbol} ({full_name}) [Hidden / No Data]"
                         price_num = 0.0
                         price_str = "N/A"
                         status = "N/A"
                         details = "Hidden asset / No market data"
                     else:
-                        display_sym = symbol
-                        price_num, status, details = calc_strategy_2(bars, pc_thresh, rsi_bottom)
+                        display_sym = f"{symbol} ({full_name})"
+                        price_num, status, details = calc_strategy_2(
+                            bars, pc_thresh, rsi_bottom
+                        )
                         price_str = f"${price_num:.6f}"
 
                     return {
@@ -319,11 +378,15 @@ with tab2:
                         "_raw_price": price_num,
                         "Technical Status": status,
                         "Technical Breakdown": details,
-                        "Chart": item["chart"],
+                        "Chart Link": item["chart"],
                     }
 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
-                    futures = [executor.submit(worker_s2, item) for item in assets]
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=10
+                ) as executor:
+                    futures = [
+                        executor.submit(worker_s2, item) for item in assets
+                    ]
                     for future in concurrent.futures.as_completed(futures):
                         results.append(future.result())
 
@@ -331,7 +394,9 @@ with tab2:
                 if sort_option == "Listing Sequence (Default)":
                     results.sort(key=lambda x: x["#"])
                 elif sort_option == "Strategy Score / Signal Status":
-                    results.sort(key=lambda x: x["Technical Status"], reverse=True)
+                    results.sort(
+                        key=lambda x: x["Technical Status"], reverse=True
+                    )
                 elif sort_option == "Price (High to Low)":
                     results.sort(key=lambda x: x["_raw_price"], reverse=True)
                 elif sort_option == "Price (Low to High)":
@@ -342,5 +407,11 @@ with tab2:
                 for r in results:
                     del r["_raw_price"]
 
-                st.success(f"Successfully processed {len(results)} assets strictly from SEO config list!")
-                st.dataframe(results, use_container_width=True)
+                st.success(
+                    f"Successfully processed {len(results)} assets directly from SEO config list!"
+                )
+                st.dataframe(
+                    results,
+                    use_container_width=True,
+                    column_config={"Chart Link": st.column_config.LinkColumn()},
+                )
