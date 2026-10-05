@@ -1,4 +1,3 @@
-import hashlib
 import time
 import pandas as pd
 import requests
@@ -11,31 +10,6 @@ st.set_page_config(
     page_icon="📈",
     layout="wide"
 )
-
-# --- SECURITY & AUTHENTICATION ---
-# Pre-computed SHA-256 Hash for the access key
-PASS_HASH = "8c353c7c1ffc8e7e178a9c4be46313364f9b88235e297a7eb845f8f85f54aa2f"
-
-def verify_access_key(key_input: str) -> bool:
-    """Verifies SHA-256 hash against stored digest without storing raw text."""
-    return hashlib.sha256(key_input.encode()).hexdigest() == PASS_HASH
-
-if "authenticated" not in st.session_state:
-    st.session_state["authenticated"] = False
-
-if not st.session_state["authenticated"]:
-    st.markdown("<h2 style='text-align: center; margin-top: 50px;'>🔐 Access Verification Required</h2>", unsafe_allow_html=True)
-    _, col_main, _ = st.columns([1, 2, 1])
-    with col_main:
-        key_entry = st.text_input("Enter Passkey:", type="password")
-        if st.button("Authenticate", width="stretch"):
-            if verify_access_key(key_entry):
-                st.session_state["authenticated"] = True
-                st.success("Access Granted")
-                st.rerun()
-            else:
-                st.error("Invalid Passkey")
-    st.stop()
 
 # --- DATA FETCHING (250 ASSETS LIMIT) ---
 DATA_ENDPOINT = "https://www.mexc.com/api/seo/coin/config/list"
@@ -96,7 +70,7 @@ def compute_stream_data(tf: str, asset_list: list):
 # --- HEADER & CONTROLS ---
 st.title("Lowline · Market Stream Dashboard")
 
-c_search, c_tf, c_refresh, c_lock = st.columns([2, 1, 1, 1])
+c_search, c_tf, c_refresh = st.columns([3, 1, 1])
 
 with c_search:
     query = st.text_input("Filter assets", placeholder="Search symbol...")
@@ -105,10 +79,6 @@ with c_tf:
 with c_refresh:
     if st.button("🔄 Refresh", width="stretch"):
         st.cache_data.clear()
-        st.rerun()
-with c_lock:
-    if st.button("🔒 Lock", width="stretch"):
-        st.session_state["authenticated"] = False
         st.rerun()
 
 # --- DATA PROCESSING ---
