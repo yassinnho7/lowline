@@ -2,6 +2,7 @@ import concurrent.futures
 from urllib.parse import quote
 from curl_cffi import requests as async_requests
 import numpy as np
+import pandas as pd
 import requests
 import streamlit as st
 
@@ -13,9 +14,8 @@ KLINES_API = "https://api.mexc.com/api/v3/klines"
 
 
 def fetch_seo_listing_assets():
-    """Fetch top 250 assets directly from SEO endpoint bypassing Cloudflare via curl_cffi."""
+    """Fetch top 250 assets directly from SEO endpoint following exact listing order."""
     try:
-        # impersonate="chrome120" mimics real browser TLS fingerprints
         res = async_requests.get(
             LISTING_API,
             impersonate="chrome120",
@@ -27,9 +27,7 @@ def fetch_seo_listing_assets():
         )
 
         if res.status_code != 200:
-            st.error(
-                f"HTTP Error {res.status_code} while fetching asset list."
-            )
+            st.error(f"HTTP Error {res.status_code} while fetching asset list.")
             return []
 
         res_json = res.json()
@@ -60,7 +58,7 @@ def fetch_seo_listing_assets():
                         "symbol": sym_clean,
                         "full_name": full_name,
                         "is_hidden": is_hidden,
-                        "chart": chart_url,
+                        "chart_url": chart_url,
                     }
                 )
         return rows
@@ -89,7 +87,7 @@ def get_candles(symbol, tf_str, target_bars=150):
                     "h": float(item[2]),
                     "l": float(item[3]),
                     "c": float(item[4]),
-                    "v": float(item[5]),
+                    "v": float(item[5]),  # Volume / Amount
                 }
             )
         return bars
@@ -100,17 +98,23 @@ def get_candles(symbol, tf_str, target_bars=150):
 # --- STRATEGY 1 CALCULATION ---
 def calc_strategy_1(bars, w_pc, w_fisher, w_trix, w_cci):
     if not bars or len(bars) < 40:
-        return 0.0, 0.0, "N/A"
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     closes = np.array([b["c"] for b in bars])
     lows = np.array([b["l"] for b in bars])
     highs = np.array([b["h"] for b in bars])
+    volumes = np.array([b["v"] for b in bars])
 
+    # 24H Volume / Amount calculation (Sum of last bars)
+    volume_24h = np.sum(volumes[-96:]) if len(volumes) >= 96 else np.sum(volumes)
+
+    # 1. PC Distance
     lookback_pc = min(100, len(lows))
     pc_lower = np.min(lows[-lookback_pc:])
     pc_dist = ((closes[-1] / pc_lower) - 1.0) * 100.0 if pc_lower > 0 else 999.0
     s_pc = w_pc if pc_dist <= 5.0 else 0.0
 
+    # 2. Fisher Transform
     lookback_fish = min(70, len(lows))
     hl2 = (highs[-lookback_fish:] + lows[-lookback_fish:]) / 2.0
     min_l = np.min(lows[-lookback_fish:])
@@ -120,6 +124,7 @@ def calc_strategy_1(bars, w_pc, w_fisher, w_trix, w_cci):
     fisher = 0.5 * np.log((1.0 + val) / (1.0 - val))
     s_fisher = w_fisher if fisher <= -2.1 else 0.0
 
+    # 3. TRIX (15)
     def ema(data, period):
         alpha = 2.0 / (period + 1.0)
         res = np.zeros_like(data)
@@ -134,6 +139,7 @@ def calc_strategy_1(bars, w_pc, w_fisher, w_trix, w_cci):
     trix = ((e3[-1] - e3[-2]) / e3[-2]) * 10000.0 if len(e3) > 1 and e3[-2] != 0 else 0.0
     s_trix = w_trix if trix <= 0 else 0.0
 
+    # 4. CCI (40)
     lookback_cci = min(40, len(closes))
     tp = (
         highs[-lookback_cci:] + lows[-lookback_cci:] + closes[-lookback_cci:]
@@ -144,18 +150,28 @@ def calc_strategy_1(bars, w_pc, w_fisher, w_trix, w_cci):
     s_cci = w_cci if cci <= -160.0 else 0.0
 
     score = round(s_pc + s_fisher + s_trix + s_cci, 1)
-    details = f"PC:{pc_dist:.1f}% | Fish:{fisher:.2f} | TRIX:{trix:.1f} | CCI:{cci:.0f}"
-    return closes[-1], score, details
+    return (
+        closes[-1],
+        volume_24h,
+        score,
+        round(pc_dist, 2),
+        round(fisher, 2),
+        round(trix, 2),
+        round(cci, 1),
+    )
 
 
 # --- STRATEGY 2 CALCULATION ---
 def calc_strategy_2(bars, pc_threshold, rsi_bottom_thresh):
     if not bars or len(bars) < 40:
-        return 0.0, "N/A", "Insufficient Data"
+        return 0.0, 0.0, "N/A", 0.0, 0.0
 
     closes = np.array([b["c"] for b in bars])
     lows = np.array([b["l"] for b in bars])
     highs = np.array([b["h"] for b in bars])
+    volumes = np.array([b["v"] for b in bars])
+
+    volume_24h = np.sum(volumes[-96:]) if len(volumes) >= 96 else np.sum(volumes)
 
     lookback = min(130, len(lows))
     min_130 = np.min(lows[-lookback:])
@@ -182,15 +198,88 @@ def calc_strategy_2(bars, pc_threshold, rsi_bottom_thresh):
 
     signals = []
     if pc_signal:
-        signals.append("PC130 Proximity")
+        signals.append("PC130")
     if wave_signal:
-        signals.append("Adaptive Wave")
+        signals.append("Wave")
     if rsi_signal:
-        signals.append("RSI Channel Bottom")
+        signals.append("RSI Channel")
 
     status = f"TRIGGERED ({len(signals)})" if signals else "NEUTRAL"
-    details = f"Signals: {', '.join(signals) if signals else 'None'} | PC130 Dist: {pc130_dist:.2f}% | RSI: {rsi:.1f}"
-    return closes[-1], status, details
+    return closes[-1], volume_24h, status, round(pc130_dist, 2), round(rsi, 1)
+
+
+# --- STYLING HIGHLIGHT FUNCTION ---
+def style_strategy_1(df):
+    def highlight_cols(row):
+        styles = [""] * len(row)
+
+        # 1. PC Dist Styling
+        pc = row["PC Dist %"]
+        if pd.notnull(pc):
+            if pc <= 0.0:
+                styles[df.columns.get_loc("PC Dist %")] = (
+                    "background-color: #1e4620; color: #a3f7a1; font-weight: bold;"  # Green
+                )
+            elif pc <= 5.0:
+                styles[df.columns.get_loc("PC Dist %")] = (
+                    "background-color: #5c3800; color: #ffca7a; font-weight: bold;"  # Orange
+                )
+            else:
+                styles[df.columns.get_loc("PC Dist %")] = (
+                    "background-color: #4a1919; color: #f28b8b;"  # Red
+                )
+
+        # 2. Fisher Styling
+        fish = row["Fisher"]
+        if pd.notnull(fish):
+            if fish <= -4.2:
+                styles[df.columns.get_loc("Fisher")] = (
+                    "background-color: #1e4620; color: #a3f7a1; font-weight: bold;"
+                )
+            elif fish <= -2.1:
+                styles[df.columns.get_loc("Fisher")] = (
+                    "background-color: #5c3800; color: #ffca7a; font-weight: bold;"
+                )
+            else:
+                styles[df.columns.get_loc("Fisher")] = (
+                    "background-color: #4a1919; color: #f28b8b;"
+                )
+
+        # 3. TRIX Styling
+        trix = row["TRIX"]
+        if pd.notnull(trix):
+            if trix <= -220.0:
+                styles[df.columns.get_loc("TRIX")] = (
+                    "background-color: #1e4620; color: #a3f7a1; font-weight: bold;"
+                )
+            elif trix <= 0.0:
+                styles[df.columns.get_loc("TRIX")] = (
+                    "background-color: #5c3800; color: #ffca7a; font-weight: bold;"
+                )
+            else:
+                styles[df.columns.get_loc("TRIX")] = (
+                    "background-color: #4a1919; color: #f28b8b;"
+                )
+
+        # 4. CCI Styling
+        cci = row["CCI"]
+        if pd.notnull(cci):
+            if cci <= -180.0:
+                styles[df.columns.get_loc("CCI")] = (
+                    "background-color: #1e4620; color: #a3f7a1; font-weight: bold;"
+                )
+            elif cci <= -160.0:
+                styles[df.columns.get_loc("CCI")] = (
+                    "background-color: #5c3800; color: #ffca7a; font-weight: bold;"
+                )
+            else:
+                styles[df.columns.get_loc("CCI")] = (
+                    "background-color: #4a1919; color: #f28b8b;"
+                )
+
+        return styles
+
+    return df.style.apply(highlight_cols, axis=1)
 
 
 # --- USER INTERFACE ---
@@ -230,9 +319,7 @@ with tab1:
         w_cci = st.number_input("CCI Weight %", value=10, key="s1_cci")
 
     if st.button("Run Strategy 1 Scan", type="primary"):
-        with st.spinner(
-            "Fetching top 250 assets directly from SEO endpoint..."
-        ):
+        with st.spinner("Fetching top 250 assets directly from SEO endpoint..."):
             assets = fetch_seo_listing_assets()
 
             if assets:
@@ -245,12 +332,28 @@ with tab1:
                     bars = get_candles(symbol, custom_tf)
 
                     if is_hidden or not bars:
-                        display_sym = f"⚠️ {symbol} ({full_name}) [Hidden / No Data]"
-                        price_num, score, details = 0.0, 0.0, "No market data"
+                        display_sym = f"⚠️ {symbol} ({full_name})"
+                        price_num, vol_24h, score, pc, fish, trix, cci = (
+                            0.0,
+                            0.0,
+                            0.0,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
                         price_str = "N/A"
                     else:
                         display_sym = f"{symbol} ({full_name})"
-                        price_num, score, details = calc_strategy_1(
+                        (
+                            price_num,
+                            vol_24h,
+                            score,
+                            pc,
+                            fish,
+                            trix,
+                            cci,
+                        ) = calc_strategy_1(
                             bars, w_pc, w_fisher, w_trix, w_cci
                         )
                         price_str = f"${price_num:.6f}"
@@ -258,28 +361,28 @@ with tab1:
                     return {
                         "#": item["listing_rank"],
                         "Symbol": display_sym,
+                        "Chart Link": item["chart_url"],
                         "Price": price_str,
                         "_raw_price": price_num,
+                        "24H Amount (USDT)": f"${vol_24h:,.2f}",
                         "Setup Score / 100": score,
-                        "Indicator Details": details,
-                        "Chart Link": item["chart"],
+                        "PC Dist %": pc,
+                        "Fisher": fish,
+                        "TRIX": trix,
+                        "CCI": cci,
                     }
 
                 with concurrent.futures.ThreadPoolExecutor(
                     max_workers=10
                 ) as executor:
-                    futures = [
-                        executor.submit(worker_s1, item) for item in assets
-                    ]
+                    futures = [executor.submit(worker_s1, item) for item in assets]
                     for future in concurrent.futures.as_completed(futures):
                         results.append(future.result())
 
                 if sort_option == "Listing Sequence (Default)":
                     results.sort(key=lambda x: x["#"])
                 elif sort_option == "Strategy Score / Signal Status":
-                    results.sort(
-                        key=lambda x: x["Setup Score / 100"], reverse=True
-                    )
+                    results.sort(key=lambda x: x["Setup Score / 100"], reverse=True)
                 elif sort_option == "Price (High to Low)":
                     results.sort(key=lambda x: x["_raw_price"], reverse=True)
                 elif sort_option == "Price (Low to High)":
@@ -290,20 +393,25 @@ with tab1:
                 for r in results:
                     del r["_raw_price"]
 
+                df_s1 = pd.DataFrame(results)
+                styled_df = style_strategy_1(df_s1)
+
                 st.success(
                     f"Successfully processed {len(results)} assets directly from SEO config list!"
                 )
                 st.dataframe(
-                    results,
+                    styled_df,
                     use_container_width=True,
-                    column_config={"Chart Link": st.column_config.LinkColumn()},
+                    column_config={
+                        "Chart Link": st.column_config.LinkColumn(
+                            "Symbol Link", display_text=r"https://www\.mexc\.com/exchange/(.*)_USDT"
+                        )
+                    },
                 )
 
 # ----------------- TAB 2 -----------------
 with tab2:
-    st.subheader(
-        "Strategy 2 - PC130 Proximity + Adaptive Wave + RSI Channel Bottom"
-    )
+    st.subheader("Strategy 2 - PC130 Proximity + Adaptive Wave + RSI Channel Bottom")
     col1, col2 = st.columns(2)
     with col1:
         pc_thresh = st.number_input(
@@ -315,9 +423,7 @@ with tab2:
         )
 
     if st.button("Run Strategy 2 Scan", type="primary"):
-        with st.spinner(
-            "Fetching top 250 assets directly from SEO endpoint..."
-        ):
+        with st.spinner("Fetching top 250 assets directly from SEO endpoint..."):
             assets = fetch_seo_listing_assets()
 
             if assets:
@@ -330,45 +436,43 @@ with tab2:
                     bars = get_candles(symbol, custom_tf)
 
                     if is_hidden or not bars:
-                        display_sym = f"⚠️ {symbol} ({full_name}) [Hidden / No Data]"
-                        price_num = 0.0
-                        price_str, status, details = (
-                            "N/A",
-                            "N/A",
-                            "No market data",
-                        )
+                        display_sym = f"⚠️ {symbol} ({full_name})"
+                        price_num, vol_24h = 0.0, 0.0
+                        price_str, status, pc130, rsi = "N/A", "N/A", None, None
                     else:
                         display_sym = f"{symbol} ({full_name})"
-                        price_num, status, details = calc_strategy_2(
-                            bars, pc_thresh, rsi_bottom
-                        )
+                        (
+                            price_num,
+                            vol_24h,
+                            status,
+                            pc130,
+                            rsi,
+                        ) = calc_strategy_2(bars, pc_thresh, rsi_bottom)
                         price_str = f"${price_num:.6f}"
 
                     return {
                         "#": item["listing_rank"],
                         "Symbol": display_sym,
+                        "Chart Link": item["chart_url"],
                         "Price": price_str,
                         "_raw_price": price_num,
+                        "24H Amount (USDT)": f"${vol_24h:,.2f}",
                         "Technical Status": status,
-                        "Technical Breakdown": details,
-                        "Chart Link": item["chart"],
+                        "PC130 Dist %": pc130,
+                        "RSI Channel": rsi,
                     }
 
                 with concurrent.futures.ThreadPoolExecutor(
                     max_workers=10
                 ) as executor:
-                    futures = [
-                        executor.submit(worker_s2, item) for item in assets
-                    ]
+                    futures = [executor.submit(worker_s2, item) for item in assets]
                     for future in concurrent.futures.as_completed(futures):
                         results.append(future.result())
 
                 if sort_option == "Listing Sequence (Default)":
                     results.sort(key=lambda x: x["#"])
                 elif sort_option == "Strategy Score / Signal Status":
-                    results.sort(
-                        key=lambda x: x["Technical Status"], reverse=True
-                    )
+                    results.sort(key=lambda x: x["Technical Status"], reverse=True)
                 elif sort_option == "Price (High to Low)":
                     results.sort(key=lambda x: x["_raw_price"], reverse=True)
                 elif sort_option == "Price (Low to High)":
@@ -379,11 +483,17 @@ with tab2:
                 for r in results:
                     del r["_raw_price"]
 
+                df_s2 = pd.DataFrame(results)
+
                 st.success(
                     f"Successfully processed {len(results)} assets directly from SEO config list!"
                 )
                 st.dataframe(
-                    results,
+                    df_s2,
                     use_container_width=True,
-                    column_config={"Chart Link": st.column_config.LinkColumn()},
+                    column_config={
+                        "Chart Link": st.column_config.LinkColumn(
+                            "Symbol Link", display_text=r"https://www\.mexc\.com/exchange/(.*)_USDT"
+                        )
+                    },
                 )
