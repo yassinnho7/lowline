@@ -14,7 +14,7 @@ KLINES_API = "https://api.mexc.com/api/v3/klines"
 
 
 def fetch_seo_listing_assets():
-    """Fetch top 250 assets directly from SEO endpoint following exact listing order."""
+    """Fetch assets directly from SEO endpoint following exact listing order."""
     try:
         res = async_requests.get(
             LISTING_API,
@@ -37,7 +37,7 @@ def fetch_seo_listing_assets():
             data = data.get("result") or data.get("list") or []
 
         rows = []
-        for idx, item in enumerate(data[:250], 1):
+        for idx, item in enumerate(data, 1):
             symbol_name = (
                 item.get("symbolName") or item.get("currency") or item.get("symbol")
             )
@@ -203,7 +203,7 @@ def calc_strategy_2(bars, pc_threshold, rsi_bottom_thresh):
     return closes[-1], volume_24h, status, round(pc130_dist, 2), round(rsi, 1)
 
 
-# --- STRATEGY 3 CALCULATION (Dynamic Pivot Channel) ---
+# --- STRATEGY 3 CALCULATION (Dynamic Pivot Channel with Offset Support) ---
 def calc_strategy_3(
     bars,
     left_bars=8,
@@ -211,6 +211,7 @@ def calc_strategy_3(
     fallback_length=8,
     black_left=16,
     black_right=2,
+    black_offset=-2,
 ):
     if not bars or len(bars) < max(
         left_bars + right_bars, black_left + black_right, 40
@@ -287,16 +288,18 @@ def calc_strategy_3(
 
         black_steps[i] = current_black
 
-    last_close = closes[-1]
-    last_sup = final_sup[-1]
-    last_res = final_res[-1]
-    last_black = black_steps[-1]
+    # Apply offset evaluation index safely
+    eval_idx = n - 1 + black_offset
+    eval_idx = max(0, min(eval_idx, n - 1))
 
-    # Calculate Setup Score based on proximity to Support & Black Line
+    last_close = closes[eval_idx]
+    last_sup = final_sup[eval_idx]
+    last_res = final_res[eval_idx]
+
     sup_dist = (
         ((last_close - last_sup) / last_sup) * 100.0 if last_sup > 0 else 999.0
     )
-    
+
     score = 0.0
     if sup_dist <= 0.5:
         score = 100.0
@@ -309,7 +312,11 @@ def calc_strategy_3(
     else:
         score = max(0.0, 100.0 - sup_dist * 3.0)
 
-    status = "BUY SETUP (TRUE TOUCH)" if sup_dist <= 2.0 else ("NEAR SUPPORT" if sup_dist <= 5.0 else "NEUTRAL")
+    status = (
+        "BUY SETUP (TRUE TOUCH)"
+        if sup_dist <= 2.0
+        else ("NEAR SUPPORT" if sup_dist <= 5.0 else "NEUTRAL")
+    )
 
     return (
         last_close,
@@ -321,7 +328,7 @@ def calc_strategy_3(
     )
 
 
-# --- STYLING HIGHLIGHT FUNCTION ---
+# --- STYLING HIGHLIGHT FUNCTION FOR S1 ---
 def style_strategy_1(df):
     def highlight_cols(row):
         styles = [""] * len(row)
@@ -339,52 +346,6 @@ def style_strategy_1(df):
                 styles[df.columns.get_loc("PC Dist %")] = (
                     "background-color: #4a1919; color: #f28b8b;"
                 )
-
-        fish = row["Fisher"]
-        if pd.notnull(fish):
-            if fish <= -4.2:
-                styles[df.columns.get_loc("Fisher")] = (
-                    "background-color: #1e4620; color: #a3f7a1; font-weight: bold;"
-                )
-            elif fish <= -2.1:
-                styles[df.columns.get_loc("Fisher")] = (
-                    "background-color: #5c3800; color: #ffca7a; font-weight: bold;"
-                )
-            else:
-                styles[df.columns.get_loc("Fisher")] = (
-                    "background-color: #4a1919; color: #f28b8b;"
-                )
-
-        trix = row["TRIX"]
-        if pd.notnull(trix):
-            if trix <= -220.0:
-                styles[df.columns.get_loc("TRIX")] = (
-                    "background-color: #1e4620; color: #a3f7a1; font-weight: bold;"
-                )
-            elif trix <= 0.0:
-                styles[df.columns.get_loc("TRIX")] = (
-                    "background-color: #5c3800; color: #ffca7a; font-weight: bold;"
-                )
-            else:
-                styles[df.columns.get_loc("TRIX")] = (
-                    "background-color: #4a1919; color: #f28b8b;"
-                )
-
-        cci = row["CCI"]
-        if pd.notnull(cci):
-            if cci <= -180.0:
-                styles[df.columns.get_loc("CCI")] = (
-                    "background-color: #1e4620; color: #a3f7a1; font-weight: bold;"
-                )
-            elif cci <= -160.0:
-                styles[df.columns.get_loc("CCI")] = (
-                    "background-color: #5c3800; color: #ffca7a; font-weight: bold;"
-                )
-            else:
-                styles[df.columns.get_loc("CCI")] = (
-                    "background-color: #4a1919; color: #f28b8b;"
-                )
-
         return styles
 
     return df.style.apply(highlight_cols, axis=1)
@@ -398,11 +359,15 @@ custom_tf = st.sidebar.text_input(
     "Custom Timeframe (e.g., 1m, 5m, 15m, 1h, 4h, 1d):", value="15m"
 )
 
+max_scan_limit = st.sidebar.slider(
+    "Filter: Max New Listings to Scan", minval=10, maxval=250, value=250, step=10
+)
+
 sort_option = st.sidebar.selectbox(
     "Sort Results By:",
     options=[
         "Listing Sequence (Default)",
-        "Strategy Score / Signal Status",
+        "Strategy Score (Highest to Lowest) 🏆",
         "Price (High to Low)",
         "Price (Low to High)",
         "Symbol Name (A-Z)",
@@ -431,8 +396,8 @@ with tab1:
         w_cci = st.number_input("CCI Weight %", value=10, key="s1_cci")
 
     if st.button("Run Strategy 1 Scan", type="primary"):
-        with st.spinner("Fetching top 250 assets directly from SEO endpoint..."):
-            assets = fetch_seo_listing_assets()
+        with st.spinner("Fetching assets directly from SEO endpoint..."):
+            assets = fetch_seo_listing_assets()[:max_scan_limit]
 
             if assets:
                 results = []
@@ -493,7 +458,7 @@ with tab1:
 
                 if sort_option == "Listing Sequence (Default)":
                     results.sort(key=lambda x: x["#"])
-                elif sort_option == "Strategy Score / Signal Status":
+                elif sort_option == "Strategy Score (Highest to Lowest) 🏆":
                     results.sort(key=lambda x: x["Setup Score / 100"], reverse=True)
                 elif sort_option == "Price (High to Low)":
                     results.sort(key=lambda x: x["_raw_price"], reverse=True)
@@ -509,7 +474,7 @@ with tab1:
                 styled_df = style_strategy_1(df_s1)
 
                 st.success(
-                    f"Successfully processed {len(results)} assets directly from SEO config list!"
+                    f"Successfully processed {len(results)} assets based on your filter!"
                 )
                 st.dataframe(
                     styled_df,
@@ -535,8 +500,8 @@ with tab2:
         )
 
     if st.button("Run Strategy 2 Scan", type="primary"):
-        with st.spinner("Fetching top 250 assets directly from SEO endpoint..."):
-            assets = fetch_seo_listing_assets()
+        with st.spinner("Fetching assets directly from SEO endpoint..."):
+            assets = fetch_seo_listing_assets()[:max_scan_limit]
 
             if assets:
                 results = []
@@ -583,7 +548,7 @@ with tab2:
 
                 if sort_option == "Listing Sequence (Default)":
                     results.sort(key=lambda x: x["#"])
-                elif sort_option == "Strategy Score / Signal Status":
+                elif sort_option == "Strategy Score (Highest to Lowest) 🏆":
                     results.sort(key=lambda x: x["Technical Status"], reverse=True)
                 elif sort_option == "Price (High to Low)":
                     results.sort(key=lambda x: x["_raw_price"], reverse=True)
@@ -598,7 +563,7 @@ with tab2:
                 df_s2 = pd.DataFrame(results)
 
                 st.success(
-                    f"Successfully processed {len(results)} assets directly from SEO config list!"
+                    f"Successfully processed {len(results)} assets based on your filter!"
                 )
                 st.dataframe(
                     df_s2,
@@ -622,10 +587,13 @@ with tab3:
         s3_black_right = st.number_input("Black Line Right Bars", value=2, key="s3_br")
     with col3:
         s3_fallback = st.number_input("Fallback Length", value=8, key="s3_fb")
+        s3_offset = st.number_input(
+            "Black Line Shift (Offset)", value=-2, key="s3_off"
+        )
 
     if st.button("Run Strategy 3 Scan", type="primary"):
-        with st.spinner("Fetching top 250 assets directly from SEO endpoint..."):
-            assets = fetch_seo_listing_assets()
+        with st.spinner("Fetching assets directly from SEO endpoint..."):
+            assets = fetch_seo_listing_assets()[:max_scan_limit]
 
             if assets:
                 results = []
@@ -656,6 +624,7 @@ with tab3:
                             int(s3_fallback),
                             int(s3_black_left),
                             int(s3_black_right),
+                            int(s3_offset),
                         )
                         price_str = f"${price_num:.6f}"
 
@@ -681,7 +650,7 @@ with tab3:
 
                 if sort_option == "Listing Sequence (Default)":
                     results.sort(key=lambda x: x["#"])
-                elif sort_option == "Strategy Score / Signal Status":
+                elif sort_option == "Strategy Score (Highest to Lowest) 🏆":
                     results.sort(key=lambda x: x["Setup Score / 100"], reverse=True)
                 elif sort_option == "Price (High to Low)":
                     results.sort(key=lambda x: x["_raw_price"], reverse=True)
@@ -696,7 +665,7 @@ with tab3:
                 df_s3 = pd.DataFrame(results)
 
                 st.success(
-                    f"Successfully processed {len(results)} assets directly from SEO config list!"
+                    f"Successfully processed {len(results)} assets based on your filter!"
                 )
                 st.dataframe(
                     df_s3,
