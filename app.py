@@ -359,8 +359,9 @@ custom_tf = st.sidebar.text_input(
     "Custom Timeframe (e.g., 1m, 5m, 15m, 1h, 4h, 1d):", value="15m"
 )
 
+# تم تصحيح min_value و max_value هنا بدلاً من minval و maxval
 max_scan_limit = st.sidebar.slider(
-    "Filter: Max New Listings to Scan", minval=10, maxval=250, value=250, step=10
+    "Filter: Max New Listings to Scan", min_value=10, max_value=250, value=250, step=10
 )
 
 sort_option = st.sidebar.selectbox(
@@ -644,35 +645,4 @@ with tab3:
                 with concurrent.futures.ThreadPoolExecutor(
                     max_workers=10
                 ) as executor:
-                    futures = [executor.submit(worker_s3, item) for item in assets]
-                    for future in concurrent.futures.as_completed(futures):
-                        results.append(future.result())
-
-                if sort_option == "Listing Sequence (Default)":
-                    results.sort(key=lambda x: x["#"])
-                elif sort_option == "Strategy Score (Highest to Lowest) 🏆":
-                    results.sort(key=lambda x: x["Setup Score / 100"], reverse=True)
-                elif sort_option == "Price (High to Low)":
-                    results.sort(key=lambda x: x["_raw_price"], reverse=True)
-                elif sort_option == "Price (Low to High)":
-                    results.sort(key=lambda x: x["_raw_price"])
-                elif sort_option == "Symbol Name (A-Z)":
-                    results.sort(key=lambda x: x["Symbol"])
-
-                for r in results:
-                    del r["_raw_price"]
-
-                df_s3 = pd.DataFrame(results)
-
-                st.success(
-                    f"Successfully processed {len(results)} assets based on your filter!"
-                )
-                st.dataframe(
-                    df_s3,
-                    use_container_width=True,
-                    column_config={
-                        "Chart Link": st.column_config.LinkColumn(
-                            "Symbol Link", display_text=r"https://www\.mexc\.com/exchange/(.*)_USDT"
-                        )
-                    },
-                )
+                    futures = [executor.submit(worker_s3, item) for item in assets
