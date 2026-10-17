@@ -381,7 +381,7 @@ with tab1:
 
                 st.success(f"Successfully processed {len(results)} assets based on your filter!")
                 st.dataframe(styled_df, use_container_width=True, column_config={
-                    "Chart Link": st.column_config.LinkColumn("Symbol Link", display_text=r"https://www\.mexc\.com/exchange/(.*)_USDT")
+                    "Chart Link": st.column_config.LinkColumn("Symbol Link", display_text="View Chart")
                 })
 
 # ----------------- TAB 2 -----------------
@@ -446,4 +446,70 @@ with tab2:
 
                 st.success(f"Successfully processed {len(results)} assets based on your filter!")
                 st.dataframe(df_s2, use_container_width=True, column_config={
-                    "Chart Link": st.column_config.LinkColumn("Symbol Link", display_text=r"https
+                    "Chart Link": st.column_config.LinkColumn("Symbol Link", display_text="View Chart")
+                })
+
+# ----------------- TAB 3 -----------------
+with tab3:
+    st.subheader("Strategy 3 - Dynamic Pivot Channel (V3.2 Pro Custom)")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        s3_left = st.number_input("Channel Left Bars", value=8, key="s3_l")
+        s3_black_left = st.number_input("Black Line Left Bars", value=16, key="s3_bl")
+    with col2:
+        s3_right = st.number_input("Channel Right Bars", value=3, key="s3_r")
+        s3_black_right = st.number_input("Black Line Right Bars", value=2, key="s3_br")
+    with col3:
+        s3_fallback = st.number_input("Fallback Length", value=8, key="s3_fb")
+        s3_offset = st.number_input("Black Line Shift (Offset)", value=-2, key="s3_off")
+
+    if st.button("Run Strategy 3 Scan", type="primary"):
+        with st.spinner("Fetching assets directly from SEO endpoint..."):
+            assets = fetch_seo_listing_assets()[:max_scan_limit]
+
+            if assets:
+                results = []
+                def worker_s3(item):
+                    symbol = item["symbol"]
+                    full_name = item["full_name"]
+                    is_hidden = item["is_hidden"]
+                    bars = get_candles(symbol, custom_tf)
+
+                    if is_hidden or not bars:
+                        display_sym = f"⚠️ {symbol} ({full_name})"
+                        price_num, vol_24h, score = 0.0, 0.0, 0.0
+                        price_str, status, sup_val, res_val = "N/A", "N/A", 0.0, 0.0
+                    else:
+                        display_sym = f"{symbol} ({full_name})"
+                        price_num, vol_24h, score, status, sup_val, res_val = calc_strategy_3(
+                            bars,
+                            int(s3_left),
+                            int(s3_right),
+                            int(s3_fallback),
+                            int(s3_black_left),
+                            int(s3_black_right),
+                            int(s3_offset),
+                        )
+                        price_str = f"${price_num:.6f}"
+
+                    return {
+                        "#": item["listing_rank"],
+                        "Symbol": display_sym,
+                        "Chart Link": item["chart_url"],
+                        "Price": price_str,
+                        "_raw_price": price_num,
+                        "24H Amount (USDT)": f"${vol_24h:,.2f}",
+                        "Setup Score / 100": score,
+                        "Status": status,
+                        "Dynamic Support": sup_val,
+                        "Dynamic Resistance": res_val,
+                    }
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                    futures = [executor.submit(worker_s3, item) for item in assets]
+                    for future in concurrent.futures.as_completed(futures):
+                        results.append(future.result())
+
+                if sort_option == "Listing Sequence (Default)":
+                    results.sort(key=lambda x: x["#"])
+                elif sort_option == "
