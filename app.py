@@ -68,12 +68,30 @@ def fetch_seo_listing_assets():
 
 
 def get_candles(symbol, tf_str, target_bars=150):
-    """Fetch OHLCV klines for specified timeframe with automatic 60m->1h fix."""
+    """Fetch OHLCV klines with strict compliance to MEXC API supported intervals."""
     clean_tf = tf_str.strip().lower()
-    if clean_tf == "60m":
-        clean_tf = "1h"
 
-    params = {"symbol": f"{symbol}USDT", "interval": clean_tf, "limit": target_bars}
+    # Mapping user input to MEXC official API accepted intervals
+    # MEXC officially supports: 1m, 5m, 15m, 30m, 60m, 4h, 1d, 1W, 1M
+    tf_mapping = {
+        "1m": "1m",
+        "5m": "5m",
+        "15m": "15m",
+        "30m": "30m",
+        "60m": "60m",
+        "1h": "60m",  # MEXC requires '60m' for 1 hour
+        "4h": "4h",
+        "1d": "1d",
+        "1w": "1W",
+        "1m_month": "1M",
+    }
+
+    api_tf = tf_mapping.get(clean_tf)
+    if not api_tf:
+        # Fallback for unsupported timeframes like 2h, defaulting safely to 60m
+        api_tf = "60m"
+
+    params = {"symbol": f"{symbol}USDT", "interval": api_tf, "limit": target_bars}
     try:
         res = requests.get(KLINES_API, params=params, timeout=4)
         if res.status_code != 200:
@@ -218,7 +236,6 @@ def calc_strategy_3(
     black_offset=-2,
     min_volume_usdt=10000.0,
 ):
-    # Safe check for low data returning exactly 10 values to prevent Unpacking errors
     if not bars or len(bars) < 20:
         return 0.0, 0.0, 0.0, "Low Data", 0.0, 0.0, 0.0, 0.0, 0.0, "Low Data"
 
@@ -372,7 +389,7 @@ st.title("Lowline Analytics Dashboard")
 
 st.sidebar.header("Global Configurations")
 custom_tf = st.sidebar.text_input(
-    "Custom Timeframe (e.g., 15m, 1h, 4h, 1d):", value="1h"
+    "Timeframe (Supported: 15m, 30m, 60m / 1h, 4h, 1d):", value="60m"
 )
 max_scan_limit = st.sidebar.slider(
     "Filter: Max New Listings to Scan", min_value=10, max_value=250, value=100, step=10
