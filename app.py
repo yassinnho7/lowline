@@ -14,7 +14,7 @@ KLINES_API = "https://api.mexc.com/api/v3/klines"
 
 
 def fetch_seo_listing_assets():
-    """Fetch top 250 assets directly from SEO endpoint following exact listing order."""
+    """Fetch top assets directly from SEO endpoint following exact listing order."""
     try:
         res = async_requests.get(
             LISTING_API,
@@ -203,7 +203,7 @@ def calc_strategy_2(bars, pc_threshold, rsi_bottom_thresh):
     return closes[-1], volume_24h, status, round(pc130_dist, 2), round(rsi, 1)
 
 
-# --- STRATEGY 3 CALCULATION (Dynamic Pivot Channel) ---
+# --- STRATEGY 3 CALCULATION (Dynamic Pivot Channel + Risk/Reward & SL/TP) ---
 def calc_strategy_3(
     bars,
     left_bars=8,
@@ -212,11 +212,12 @@ def calc_strategy_3(
     black_left=16,
     black_right=2,
     black_offset=-2,
+    min_volume_usdt=10000.0,
 ):
     if not bars or len(bars) < max(
         left_bars + right_bars, black_left + black_right, 40
     ):
-        return 0.0, 0.0, 0.0, "N/A", 0.0, 0.0
+        return 0.0, 0.0, 0.0, "N/A", 0.0, 0.0, 0.0, 0.0, "Low Data"
 
     closes = np.array([b["c"] for b in bars])
     lows = np.array([b["l"] for b in bars])
@@ -225,6 +226,9 @@ def calc_strategy_3(
 
     volume_24h = np.sum(volumes[-96:]) if len(volumes) >= 96 else np.sum(volumes)
     n = len(closes)
+
+    # Volume / Wash trading check
+    vol_status = "Healthy" if volume_24h >= min_volume_usdt else "Low Liquidity ⚠️"
 
     sup_lines = np.full(n, np.nan)
     res_lines = np.full(n, np.nan)
@@ -317,6 +321,15 @@ def calc_strategy_3(
         else ("NEAR SUPPORT" if sup_dist <= 5.0 else "NEUTRAL")
     )
 
+    # --- Risk Management: Stop Loss & Take Profit & R:R Ratio ---
+    # Stop Loss placed 1.5% below Dynamic Support
+    stop_loss = round(last_sup * 0.985, 6)
+    take_profit = round(last_res, 6)
+
+    risk = last_close - stop_loss
+    reward = take_profit - last_close
+    rr_ratio = round(reward / risk, 2) if risk > 0 else 0.0
+
     return (
         last_close,
         volume_24h,
@@ -324,6 +337,10 @@ def calc_strategy_3(
         status,
         round(last_sup, 6),
         round(last_res, 6),
+        stop_loss,
+        take_profit,
+        rr_ratio,
+        vol_status,
     )
 
 
@@ -355,10 +372,13 @@ st.title("Lowline Analytics Dashboard")
 
 st.sidebar.header("Global Configurations")
 custom_tf = st.sidebar.text_input(
-    "Custom Timeframe (e.g., 1m, 5m, 15m, 1h, 4h, 1d):", value="15m"
+    "Custom Timeframe (e.g., 15m, 60m, 4h, 1d):", value="60m"
 )
 max_scan_limit = st.sidebar.slider(
-    "Filter: Max New Listings to Scan", min_value=10, max_value=250, value=250, step=10
+    "Filter: Max New Listings to Scan", min_value=10, max_value=250, value=100, step=10
+)
+min_vol_filter = st.sidebar.number_input(
+    "Min 24H Volume Filter (USDT)", value=50000.0, step=10000.0
 )
 
 sort_option = st.sidebar.selectbox(
@@ -366,18 +386,18 @@ sort_option = st.sidebar.selectbox(
     options=[
         "Listing Sequence (Default)",
         "Strategy Score (Highest to Lowest)",
+        "Risk/Reward Ratio (Best R:R)",
         "Price (High to Low)",
         "Price (Low to High)",
         "Symbol Name (A-Z)",
     ],
 )
 
-# Tabs definition
 tab1, tab2, tab3 = st.tabs(
     [
         "Strategy 1 (Quantitative Score)",
         "Strategy 2 (Pine Technical View)",
-        "Strategy 3 (Dynamic Pivot Channel)",
+        "Strategy 3 (Dynamic Pivot Channel + Risk Management)",
     ]
 )
 
@@ -578,7 +598,9 @@ with tab2:
 
 # ================= TAB 3 =================
 with tab3:
-    st.subheader("Strategy 3 - Dynamic Pivot Channel (V3.2 Pro Custom)")
+    st.subheader(
+        "Strategy 3 - Dynamic Pivot Channel + Risk Management (SL, TP, R:R)"
+    )
     col1, col2, col3 = st.columns(3)
     with col1:
         s3_left = st.number_input("Channel Left Bars", value=8, key="s3_l")
@@ -593,7 +615,9 @@ with tab3:
         )
 
     if st.button("Run Strategy 3 Scan", type="primary", key="btn_s3"):
-        with st.spinner("Fetching assets directly from SEO endpoint..."):
+        with st.spinner(
+            "Fetching assets & calculating Dynamic Channels, SL, TP & R:R..."
+        ):
             assets = fetch_seo_listing_assets()[:max_scan_limit]
 
             if assets:
@@ -608,7 +632,9 @@ with tab3:
                     if is_hidden or not bars:
                         display_sym = f"⚠️ {symbol} ({full_name})"
                         price_num, vol_24h, score = 0.0, 0.0, 0.0
-                        price_str, status, sup_val, res_val = "N/A", "N/A", 0.0, 0.0
+                        price_str, status = "N/A", "N/A"
+                        sup_val, res_val, sl, tp, rr = 0.0, 0.0, 0.0, 0.0, 0.0
+                        vol_status = "N/A"
                     else:
                         display_sym = f"{symbol} ({full_name})"
                         (
@@ -618,6 +644,10 @@ with tab3:
                             status,
                             sup_val,
                             res_val,
+                            sl,
+                            tp,
+                            rr,
+                            vol_status,
                         ) = calc_strategy_3(
                             bars,
                             int(s3_left),
@@ -626,6 +656,7 @@ with tab3:
                             int(s3_black_left),
                             int(s3_black_right),
                             int(s3_offset),
+                            min_vol_filter,
                         )
                         price_str = f"${price_num:.6f}"
 
@@ -639,7 +670,10 @@ with tab3:
                         "Setup Score / 100": score,
                         "Status": status,
                         "Dynamic Support": sup_val,
-                        "Dynamic Resistance": res_val,
+                        "Stop Loss (SL)": sl,
+                        "Take Profit (TP)": tp,
+                        "Risk/Reward (R:R)": rr,
+                        "Liquidity": vol_status,
                     }
 
                 with concurrent.futures.ThreadPoolExecutor(
@@ -653,6 +687,8 @@ with tab3:
                     results.sort(key=lambda x: x["#"])
                 elif sort_option == "Strategy Score (Highest to Lowest)":
                     results.sort(key=lambda x: x["Setup Score / 100"], reverse=True)
+                elif sort_option == "Risk/Reward Ratio (Best R:R)":
+                    results.sort(key=lambda x: x["Risk/Reward (R:R)"], reverse=True)
                 elif sort_option == "Price (High to Low)":
                     results.sort(key=lambda x: x["_raw_price"], reverse=True)
                 elif sort_option == "Price (Low to High)":
@@ -666,7 +702,7 @@ with tab3:
                 df_s3 = pd.DataFrame(results)
 
                 st.success(
-                    f"Successfully processed {len(results)} assets based on your filter!"
+                    f"Successfully processed {len(results)} assets with Risk & Liquidity Filters!"
                 )
                 st.dataframe(
                     df_s3,
