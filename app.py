@@ -203,4 +203,477 @@ def calc_strategy_2(bars, pc_threshold, rsi_bottom_thresh):
     return closes[-1], volume_24h, status, round(pc130_dist, 2), round(rsi, 1)
 
 
-# --- STRATEGY
+# --- STRATEGY 3 CALCULATION (Dynamic Pivot Channel) ---
+def calc_strategy_3(
+    bars,
+    left_bars=8,
+    right_bars=3,
+    fallback_length=8,
+    black_left=16,
+    black_right=2,
+    black_offset=-2,
+):
+    if not bars or len(bars) < max(
+        left_bars + right_bars, black_left + black_right, 40
+    ):
+        return 0.0, 0.0, 0.0, "N/A", 0.0, 0.0
+
+    closes = np.array([b["c"] for b in bars])
+    lows = np.array([b["l"] for b in bars])
+    highs = np.array([b["h"] for b in bars])
+    volumes = np.array([b["v"] for b in bars])
+
+    volume_24h = np.sum(volumes[-96:]) if len(volumes) >= 96 else np.sum(volumes)
+    n = len(closes)
+
+    sup_lines = np.full(n, np.nan)
+    res_lines = np.full(n, np.nan)
+    current_sup = np.nan
+    current_res = np.nan
+
+    for i in range(n):
+        check_idx = i - right_bars
+        if check_idx >= left_bars:
+            w_lows = lows[check_idx - left_bars : check_idx + right_bars + 1]
+            if len(w_lows) == left_bars + right_bars + 1 and lows[check_idx] == np.min(
+                w_lows
+            ):
+                current_sup = lows[check_idx]
+
+            w_highs = highs[check_idx - left_bars : check_idx + right_bars + 1]
+            if len(w_highs) == left_bars + right_bars + 1 and highs[check_idx] == np.max(
+                w_highs
+            ):
+                current_res = highs[check_idx]
+
+        sup_lines[i] = current_sup
+        res_lines[i] = current_res
+
+    smart_sup = np.min(lows[-fallback_length:])
+    smart_res = np.max(highs[-fallback_length:])
+
+    final_sup = np.where(np.isnan(sup_lines), smart_sup, sup_lines)
+    final_res = np.where(np.isnan(res_lines), smart_res, res_lines)
+
+    black_steps = np.full(n, np.nan)
+    current_black = np.nan
+    for i in range(n):
+        check_idx_b = i - black_right
+        p_low_b = False
+        p_high_b = False
+        val_low = np.nan
+        val_high = np.nan
+        if check_idx_b >= black_left:
+            w_lows = lows[check_idx_b - black_left : check_idx_b + black_right + 1]
+            if len(w_lows) == black_left + black_right + 1 and lows[check_idx_b] == np.min(
+                w_lows
+            ):
+                val_low = lows[check_idx_b]
+                p_low_b = True
+
+            w_highs = highs[check_idx_b - black_left : check_idx_b + black_right + 1]
+            if len(w_highs) == black_left + black_right + 1 and highs[check_idx_b] == np.max(
+                w_highs
+            ):
+                val_high = highs[check_idx_b]
+                p_high_b = True
+
+        if p_low_b:
+            current_black = val_low
+        elif p_high_b:
+            current_black = val_high
+
+        if np.isnan(current_black):
+            current_black = final_sup[i]
+
+        black_steps[i] = current_black
+
+    eval_idx = n - 1 + black_offset
+    eval_idx = max(0, min(eval_idx, n - 1))
+
+    last_close = closes[eval_idx]
+    last_sup = final_sup[eval_idx]
+    last_res = final_res[eval_idx]
+
+    sup_dist = (
+        ((last_close - last_sup) / last_sup) * 100.0 if last_sup > 0 else 999.0
+    )
+
+    score = 0.0
+    if sup_dist <= 0.5:
+        score = 100.0
+    elif sup_dist <= 2.0:
+        score = 90.0
+    elif sup_dist <= 5.0:
+        score = 70.0
+    elif sup_dist <= 10.0:
+        score = 40.0
+    else:
+        score = max(0.0, 100.0 - sup_dist * 3.0)
+
+    status = (
+        "BUY SETUP (TRUE TOUCH)"
+        if sup_dist <= 2.0
+        else ("NEAR SUPPORT" if sup_dist <= 5.0 else "NEUTRAL")
+    )
+
+    return (
+        last_close,
+        volume_24h,
+        round(score, 1),
+        status,
+        round(last_sup, 6),
+        round(last_res, 6),
+    )
+
+
+# --- STYLING HIGHLIGHT FUNCTION FOR S1 ---
+def style_strategy_1(df):
+    def highlight_cols(row):
+        styles = [""] * len(row)
+        pc = row["PC Dist %"]
+        if pd.notnull(pc):
+            if pc <= 0.0:
+                styles[df.columns.get_loc("PC Dist %")] = (
+                    "background-color: #1e4620; color: #a3f7a1; font-weight: bold;"
+                )
+            elif pc <= 5.0:
+                styles[df.columns.get_loc("PC Dist %")] = (
+                    "background-color: #5c3800; color: #ffca7a; font-weight: bold;"
+                )
+            else:
+                styles[df.columns.get_loc("PC Dist %")] = (
+                    "background-color: #4a1919; color: #f28b8b;"
+                )
+        return styles
+
+    return df.style.apply(highlight_cols, axis=1)
+
+
+# --- USER INTERFACE ---
+st.title("Lowline Analytics Dashboard")
+
+st.sidebar.header("Global Configurations")
+custom_tf = st.sidebar.text_input(
+    "Custom Timeframe (e.g., 1m, 5m, 15m, 1h, 4h, 1d):", value="15m"
+)
+max_scan_limit = st.sidebar.slider(
+    "Filter: Max New Listings to Scan", min_value=10, max_value=250, value=250, step=10
+)
+
+sort_option = st.sidebar.selectbox(
+    "Sort Results By:",
+    options=[
+        "Listing Sequence (Default)",
+        "Strategy Score (Highest to Lowest)",
+        "Price (High to Low)",
+        "Price (Low to High)",
+        "Symbol Name (A-Z)",
+    ],
+)
+
+# Tabs definition
+tab1, tab2, tab3 = st.tabs(
+    [
+        "Strategy 1 (Quantitative Score)",
+        "Strategy 2 (Pine Technical View)",
+        "Strategy 3 (Dynamic Pivot Channel)",
+    ]
+)
+
+# ================= TAB 1 =================
+with tab1:
+    st.subheader("Strategy 1 - Quantitative Multi-Factor Score")
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        w_pc = st.number_input("PC Weight %", value=40, key="s1_pc")
+    with col2:
+        w_fisher = st.number_input("Fisher Weight %", value=30, key="s1_fish")
+    with col3:
+        w_trix = st.number_input("TRIX Weight %", value=20, key="s1_trix")
+    with col4:
+        w_cci = st.number_input("CCI Weight %", value=10, key="s1_cci")
+
+    if st.button("Run Strategy 1 Scan", type="primary", key="btn_s1"):
+        with st.spinner("Fetching assets directly from SEO endpoint..."):
+            assets = fetch_seo_listing_assets()[:max_scan_limit]
+
+            if assets:
+                results = []
+
+                def worker_s1(item):
+                    symbol = item["symbol"]
+                    full_name = item["full_name"]
+                    is_hidden = item["is_hidden"]
+                    bars = get_candles(symbol, custom_tf)
+
+                    if is_hidden or not bars:
+                        display_sym = f"⚠️ {symbol} ({full_name})"
+                        price_num, vol_24h, score, pc, fish, trix, cci = (
+                            0.0,
+                            0.0,
+                            0.0,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        price_str = "N/A"
+                    else:
+                        display_sym = f"{symbol} ({full_name})"
+                        (
+                            price_num,
+                            vol_24h,
+                            score,
+                            pc,
+                            fish,
+                            trix,
+                            cci,
+                        ) = calc_strategy_1(
+                            bars, w_pc, w_fisher, w_trix, w_cci
+                        )
+                        price_str = f"${price_num:.6f}"
+
+                    return {
+                        "#": item["listing_rank"],
+                        "Symbol": display_sym,
+                        "Chart Link": item["chart_url"],
+                        "Price": price_str,
+                        "_raw_price": price_num,
+                        "24H Amount (USDT)": f"${vol_24h:,.2f}",
+                        "Setup Score / 100": score,
+                        "PC Dist %": pc,
+                        "Fisher": fish,
+                        "TRIX": trix,
+                        "CCI": cci,
+                    }
+
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=10
+                ) as executor:
+                    futures = [executor.submit(worker_s1, item) for item in assets]
+                    for future in concurrent.futures.as_completed(futures):
+                        results.append(future.result())
+
+                if sort_option == "Listing Sequence (Default)":
+                    results.sort(key=lambda x: x["#"])
+                elif sort_option == "Strategy Score (Highest to Lowest)":
+                    results.sort(key=lambda x: x["Setup Score / 100"], reverse=True)
+                elif sort_option == "Price (High to Low)":
+                    results.sort(key=lambda x: x["_raw_price"], reverse=True)
+                elif sort_option == "Price (Low to High)":
+                    results.sort(key=lambda x: x["_raw_price"])
+                elif sort_option == "Symbol Name (A-Z)":
+                    results.sort(key=lambda x: x["Symbol"])
+
+                for r in results:
+                    del r["_raw_price"]
+
+                df_s1 = pd.DataFrame(results)
+                styled_df = style_strategy_1(df_s1)
+
+                st.success(
+                    f"Successfully processed {len(results)} assets based on your filter!"
+                )
+                st.dataframe(
+                    styled_df,
+                    use_container_width=True,
+                    column_config={
+                        "Chart Link": st.column_config.LinkColumn(
+                            "Symbol Link", display_text="View Chart"
+                        )
+                    },
+                )
+
+# ================= TAB 2 =================
+with tab2:
+    st.subheader(
+        "Strategy 2 - PC130 Proximity + Adaptive Wave + RSI Channel Bottom"
+    )
+    col1, col2 = st.columns(2)
+    with col1:
+        pc_thresh = st.number_input(
+            "PC130 Proximity Threshold (%)", value=3.0, key="s2_pc"
+        )
+    with col2:
+        rsi_bottom = st.number_input(
+            "RSI Channel Bottom Threshold", value=30.0, key="s2_rsi"
+        )
+
+    if st.button("Run Strategy 2 Scan", type="primary", key="btn_s2"):
+        with st.spinner("Fetching assets directly from SEO endpoint..."):
+            assets = fetch_seo_listing_assets()[:max_scan_limit]
+
+            if assets:
+                results = []
+
+                def worker_s2(item):
+                    symbol = item["symbol"]
+                    full_name = item["full_name"]
+                    is_hidden = item["is_hidden"]
+                    bars = get_candles(symbol, custom_tf)
+
+                    if is_hidden or not bars:
+                        display_sym = f"⚠️ {symbol} ({full_name})"
+                        price_num, vol_24h = 0.0, 0.0
+                        price_str, status, pc130, rsi = "N/A", "N/A", None, None
+                    else:
+                        display_sym = f"{symbol} ({full_name})"
+                        (
+                            price_num,
+                            vol_24h,
+                            status,
+                            pc130,
+                            rsi,
+                        ) = calc_strategy_2(bars, pc_thresh, rsi_bottom)
+                        price_str = f"${price_num:.6f}"
+
+                    return {
+                        "#": item["listing_rank"],
+                        "Symbol": display_sym,
+                        "Chart Link": item["chart_url"],
+                        "Price": price_str,
+                        "_raw_price": price_num,
+                        "24H Amount (USDT)": f"${vol_24h:,.2f}",
+                        "Technical Status": status,
+                        "PC130 Dist %": pc130,
+                        "RSI Channel": rsi,
+                    }
+
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=10
+                ) as executor:
+                    futures = [executor.submit(worker_s2, item) for item in assets]
+                    for future in concurrent.futures.as_completed(futures):
+                        results.append(future.result())
+
+                if sort_option == "Listing Sequence (Default)":
+                    results.sort(key=lambda x: x["#"])
+                elif sort_option == "Strategy Score (Highest to Lowest)":
+                    results.sort(key=lambda x: x["Technical Status"], reverse=True)
+                elif sort_option == "Price (High to Low)":
+                    results.sort(key=lambda x: x["_raw_price"], reverse=True)
+                elif sort_option == "Price (Low to High)":
+                    results.sort(key=lambda x: x["_raw_price"])
+                elif sort_option == "Symbol Name (A-Z)":
+                    results.sort(key=lambda x: x["Symbol"])
+
+                for r in results:
+                    del r["_raw_price"]
+
+                df_s2 = pd.DataFrame(results)
+
+                st.success(
+                    f"Successfully processed {len(results)} assets based on your filter!"
+                )
+                st.dataframe(
+                    df_s2,
+                    use_container_width=True,
+                    column_config={
+                        "Chart Link": st.column_config.LinkColumn(
+                            "Symbol Link", display_text="View Chart"
+                        )
+                    },
+                )
+
+# ================= TAB 3 =================
+with tab3:
+    st.subheader("Strategy 3 - Dynamic Pivot Channel (V3.2 Pro Custom)")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        s3_left = st.number_input("Channel Left Bars", value=8, key="s3_l")
+        s3_black_left = st.number_input("Black Line Left Bars", value=16, key="s3_bl")
+    with col2:
+        s3_right = st.number_input("Channel Right Bars", value=3, key="s3_r")
+        s3_black_right = st.number_input("Black Line Right Bars", value=2, key="s3_br")
+    with col3:
+        s3_fallback = st.number_input("Fallback Length", value=8, key="s3_fb")
+        s3_offset = st.number_input(
+            "Black Line Shift (Offset)", value=-2, key="s3_off"
+        )
+
+    if st.button("Run Strategy 3 Scan", type="primary", key="btn_s3"):
+        with st.spinner("Fetching assets directly from SEO endpoint..."):
+            assets = fetch_seo_listing_assets()[:max_scan_limit]
+
+            if assets:
+                results = []
+
+                def worker_s3(item):
+                    symbol = item["symbol"]
+                    full_name = item["full_name"]
+                    is_hidden = item["is_hidden"]
+                    bars = get_candles(symbol, custom_tf)
+
+                    if is_hidden or not bars:
+                        display_sym = f"⚠️ {symbol} ({full_name})"
+                        price_num, vol_24h, score = 0.0, 0.0, 0.0
+                        price_str, status, sup_val, res_val = "N/A", "N/A", 0.0, 0.0
+                    else:
+                        display_sym = f"{symbol} ({full_name})"
+                        (
+                            price_num,
+                            vol_24h,
+                            score,
+                            status,
+                            sup_val,
+                            res_val,
+                        ) = calc_strategy_3(
+                            bars,
+                            int(s3_left),
+                            int(s3_right),
+                            int(s3_fallback),
+                            int(s3_black_left),
+                            int(s3_black_right),
+                            int(s3_offset),
+                        )
+                        price_str = f"${price_num:.6f}"
+
+                    return {
+                        "#": item["listing_rank"],
+                        "Symbol": display_sym,
+                        "Chart Link": item["chart_url"],
+                        "Price": price_str,
+                        "_raw_price": price_num,
+                        "24H Amount (USDT)": f"${vol_24h:,.2f}",
+                        "Setup Score / 100": score,
+                        "Status": status,
+                        "Dynamic Support": sup_val,
+                        "Dynamic Resistance": res_val,
+                    }
+
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=10
+                ) as executor:
+                    futures = [executor.submit(worker_s3, item) for item in assets]
+                    for future in concurrent.futures.as_completed(futures):
+                        results.append(future.result())
+
+                if sort_option == "Listing Sequence (Default)":
+                    results.sort(key=lambda x: x["#"])
+                elif sort_option == "Strategy Score (Highest to Lowest)":
+                    results.sort(key=lambda x: x["Setup Score / 100"], reverse=True)
+                elif sort_option == "Price (High to Low)":
+                    results.sort(key=lambda x: x["_raw_price"], reverse=True)
+                elif sort_option == "Price (Low to High)":
+                    results.sort(key=lambda x: x["_raw_price"])
+                elif sort_option == "Symbol Name (A-Z)":
+                    results.sort(key=lambda x: x["Symbol"])
+
+                for r in results:
+                    del r["_raw_price"]
+
+                df_s3 = pd.DataFrame(results)
+
+                st.success(
+                    f"Successfully processed {len(results)} assets based on your filter!"
+                )
+                st.dataframe(
+                    df_s3,
+                    use_container_width=True,
+                    column_config={
+                        "Chart Link": st.column_config.LinkColumn(
+                            "Symbol Link", display_text="View Chart"
+                        )
+                    },
+                )
