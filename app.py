@@ -68,8 +68,12 @@ def fetch_seo_listing_assets():
 
 
 def get_candles(symbol, tf_str, target_bars=150):
-    """Fetch OHLCV klines for specified timeframe."""
-    params = {"symbol": f"{symbol}USDT", "interval": tf_str, "limit": target_bars}
+    """Fetch OHLCV klines for specified timeframe with automatic 60m->1h fix."""
+    clean_tf = tf_str.strip().lower()
+    if clean_tf == "60m":
+        clean_tf = "1h"
+
+    params = {"symbol": f"{symbol}USDT", "interval": clean_tf, "limit": target_bars}
     try:
         res = requests.get(KLINES_API, params=params, timeout=4)
         if res.status_code != 200:
@@ -214,10 +218,9 @@ def calc_strategy_3(
     black_offset=-2,
     min_volume_usdt=10000.0,
 ):
-    if not bars or len(bars) < max(
-        left_bars + right_bars, black_left + black_right, 40
-    ):
-        return 0.0, 0.0, 0.0, "N/A", 0.0, 0.0, 0.0, 0.0, "Low Data"
+    # Safe check for low data returning exactly 10 values to prevent Unpacking errors
+    if not bars or len(bars) < 20:
+        return 0.0, 0.0, 0.0, "Low Data", 0.0, 0.0, 0.0, 0.0, 0.0, "Low Data"
 
     closes = np.array([b["c"] for b in bars])
     lows = np.array([b["l"] for b in bars])
@@ -227,7 +230,6 @@ def calc_strategy_3(
     volume_24h = np.sum(volumes[-96:]) if len(volumes) >= 96 else np.sum(volumes)
     n = len(closes)
 
-    # Volume / Wash trading check
     vol_status = "Healthy" if volume_24h >= min_volume_usdt else "Low Liquidity ⚠️"
 
     sup_lines = np.full(n, np.nan)
@@ -253,8 +255,8 @@ def calc_strategy_3(
         sup_lines[i] = current_sup
         res_lines[i] = current_res
 
-    smart_sup = np.min(lows[-fallback_length:])
-    smart_res = np.max(highs[-fallback_length:])
+    smart_sup = np.min(lows[-min(fallback_length, len(lows)) :])
+    smart_res = np.max(highs[-min(fallback_length, len(highs)) :])
 
     final_sup = np.where(np.isnan(sup_lines), smart_sup, sup_lines)
     final_res = np.where(np.isnan(res_lines), smart_res, res_lines)
@@ -321,8 +323,6 @@ def calc_strategy_3(
         else ("NEAR SUPPORT" if sup_dist <= 5.0 else "NEUTRAL")
     )
 
-    # --- Risk Management: Stop Loss & Take Profit & R:R Ratio ---
-    # Stop Loss placed 1.5% below Dynamic Support
     stop_loss = round(last_sup * 0.985, 6)
     take_profit = round(last_res, 6)
 
@@ -372,7 +372,7 @@ st.title("Lowline Analytics Dashboard")
 
 st.sidebar.header("Global Configurations")
 custom_tf = st.sidebar.text_input(
-    "Custom Timeframe (e.g., 15m, 60m, 4h, 1d):", value="60m"
+    "Custom Timeframe (e.g., 15m, 1h, 4h, 1d):", value="1h"
 )
 max_scan_limit = st.sidebar.slider(
     "Filter: Max New Listings to Scan", min_value=10, max_value=250, value=100, step=10
