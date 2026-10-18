@@ -164,19 +164,36 @@ MOBY_SORTS: dict[str, tuple[str | None, bool]] = {
     "Key holders (most first)": ("key_holders", True),
 }
 
-MOBY_EXPORT_SNIPPET = """(async () => {
-  const raw = localStorage.getItem('privy:token') || '';
-  let t = raw;
-  try { const o = JSON.parse(raw); t = typeof o === 'string' ? o : (o.token || o.access_token); } catch (e) {}
-  const url = 'https://web-api.mobyscreener.com/web/api_v2/tokens/screener/leaderboard/' +
-    '?network=solana&networks=solana&networks=base&networks=bnb&networks=robinhood';
-  const r = await fetch(url, { headers: { Authorization: 'Bearer ' + t } });
-  const j = await r.json();
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([JSON.stringify(j)], { type: 'application/json' }));
-  a.download = 'moby_leaderboard.json';
-  a.click();
-})();"""
+# One-click Moby export. Saved as a bookmark it becomes a button on your
+# bookmarks bar: click it while app.moby.win is open and logged in, and it
+# downloads moby_leaderboard.json for upload into this dashboard.
+_MOBY_SNAPSHOT_JS = (
+    "(async()=>{"
+    "const raw=localStorage.getItem('privy:token')||'';"
+    "let t=raw;"
+    "try{const o=JSON.parse(raw);"
+    "t=typeof o==='string'?o:(o.token||o.access_token);}catch(e){}"
+    "if(!t){alert('No Moby login token in this tab. Open app.moby.win, sign "
+    "in, and click the bookmark there.');return;}"
+    "const url='https://web-api.mobyscreener.com/web/api_v2/tokens/screener/"
+    "leaderboard/?network=solana&networks=solana&networks=base&networks=bnb"
+    "&networks=robinhood';"
+    "const r=await fetch(url,{headers:{Authorization:'Bearer '+t}});"
+    "if(!r.ok){alert('Moby API returned HTTP '+r.status+'. Reload app.moby.win "
+    "and try again.');return;}"
+    "const j=await r.json();"
+    "const n=(j.entries||[]).length;"
+    "const a=document.createElement('a');"
+    "a.href=URL.createObjectURL(new Blob([JSON.stringify(j)],"
+    "{type:'application/json'}));"
+    "a.download='moby_leaderboard.json';"
+    "document.body.appendChild(a);a.click();a.remove();"
+    "alert('Saved moby_leaderboard.json with '+n+' tokens. Upload it in the "
+    "Lowline dashboard.');"
+    "})()"
+)
+MOBY_BOOKMARKLET = "javascript:" + _MOBY_SNAPSHOT_JS
+MOBY_CONSOLE_SNIPPET = _MOBY_SNAPSHOT_JS + ";"
 
 
 # --------------------------------------------------------------------------- #
@@ -428,8 +445,22 @@ def _int(value, default: int = 0) -> int:
         return default
 
 
-def normalize_moby_tokens(payload: dict) -> list[dict]:
-    """Accept either the bundled snapshot or a raw leaderboard API export."""
+def normalize_moby_tokens(payload) -> list[dict]:
+    """Accept the bundled snapshot, a raw leaderboard export, or a bare list."""
+    if isinstance(payload, list):
+        payload = {"entries": payload}
+    if isinstance(payload, dict):
+        has_rows = isinstance(payload.get("entries"), list) or isinstance(
+            payload.get("tokens"), list
+        )
+        if not has_rows:
+            wrapped = payload.get("data")
+            if isinstance(wrapped, dict) and isinstance(
+                wrapped.get("entries"), list
+            ):
+                payload = {"entries": wrapped["entries"]}
+            elif isinstance(wrapped, list):
+                payload = {"entries": wrapped}
     if not isinstance(payload, dict):
         return []
 
@@ -1368,39 +1399,109 @@ with st.sidebar:
             f"Moby data: {moby_origin} · {moby_captured or 'unknown time'} UTC "
             f"· {len(moby_tokens)} tokens"
         )
-        with st.expander("Refresh Moby data"):
-            st.caption(
-                "Moby's API only answers a logged-in browser tab, so a fresh "
-                "export can be uploaded at any time. Open app.moby.win, run "
-                "this snippet in the browser console, then upload the "
-                "downloaded JSON."
+        with st.expander("Get a fresh Moby snapshot"):
+            st.markdown(
+                "Moby's API only answers your logged-in browser, so the "
+                "dashboard cannot fetch it by itself. Make the button once, "
+                "then it is one click whenever you want fresh data:")
+            st.markdown(
+                "**1.** Copy the one-liner below.\n\n"
+                "**2.** Chrome → right-click the bookmarks bar → **Add "
+                "page…**, name it `Moby snapshot`, paste it into **URL**, "
+                "Save. (No bar visible? Ctrl+Shift+B.)\n\n"
+                "**3.** Open **app.moby.win**, stay logged in, click the "
+                "**Moby snapshot** bookmark → `moby_leaderboard.json` "
+                "downloads.\n\n"
+                "**4.** Upload that file here (or paste its text)."
             )
-            st.code(MOBY_EXPORT_SNIPPET, language="javascript")
+            st.code(MOBY_BOOKMARKLET, language=None)
+            st.caption(
+                "Easier drag-and-drop: open **moby_snapshot_button.html** "
+                "from the project folder and drag the red button to the "
+                "bookmarks bar."
+            )
+
             upload = st.file_uploader(
                 "moby_leaderboard.json", type=["json"], key="moby_uploader"
             )
+            pasted = st.text_area(
+                "or paste the JSON text",
+                key="moby_paste",
+                height=100,
+                placeholder='{"entries": [ … ]}',
+            )
+            col_up, col_reset = st.columns(2)
+            with col_up:
+                use_paste = st.button("Use pasted JSON", key="moby_paste_btn")
+            with col_reset:
+                reset = st.button(
+                    "Use bundled",
+                    key="moby_reset",
+                    disabled="moby_upload" not in st.session_state,
+                )
+
+            parsed_tokens: list[dict] | None = None
             if upload is not None:
                 try:
-                    parsed = normalize_moby_tokens(json.load(upload))
+                    parsed_tokens = normalize_moby_tokens(json.load(upload))
                 except Exception as exc:  # noqa: BLE001 - shown to the user
                     st.error(f"Could not read that file ({exc}).")
+            elif use_paste and pasted.strip():
+                try:
+                    parsed_tokens = normalize_moby_tokens(json.loads(pasted))
+                except Exception as exc:  # noqa: BLE001 - shown to the user
+                    st.error(f"Could not read that JSON ({exc}).")
+
+            if parsed_tokens is not None:
+                if parsed_tokens:
+                    st.session_state["moby_upload"] = {
+                        "tokens": parsed_tokens,
+                        "captured_at": datetime.now(timezone.utc).strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        ),
+                    }
+                    st.success(f"Loaded {len(parsed_tokens)} tokens.")
+                    st.rerun()
                 else:
-                    if parsed:
-                        st.session_state["moby_upload"] = {
-                            "tokens": parsed,
-                            "captured_at": datetime.now(timezone.utc).strftime(
-                                "%Y-%m-%d %H:%M:%S"
-                            ),
-                        }
-                        st.success(f"Loaded {len(parsed)} tokens.")
-                        st.rerun()
-                    else:
-                        st.error("No tokens were found in that file.")
-            if "moby_upload" in st.session_state and st.button(
-                "Use the bundled snapshot", key="moby_reset"
-            ):
+                    st.error(
+                        "No tokens found. Make sure the export came from "
+                        "app.moby.win while you were logged in."
+                    )
+            if reset:
                 del st.session_state["moby_upload"]
                 st.rerun()
+
+            st.download_button(
+                "Download current snapshot (JSON)",
+                data=json.dumps(
+                    {
+                        "captured_at_utc": moby_captured,
+                        "count": len(moby_tokens),
+                        "tokens": moby_tokens,
+                    },
+                    ensure_ascii=False,
+                ),
+                file_name="moby_snapshot.json",
+                mime="application/json",
+                key="moby_download_snapshot",
+                help=(
+                    "Backup of the universe the dashboard is using right "
+                    "now, in the same format that can be uploaded back."
+                ),
+            )
+
+            with st.expander("Prefer the browser console?"):
+                st.caption(
+                    "On the app.moby.win tab press F12, open Console, paste "
+                    "this and hit Enter. It saves the same file."
+                )
+                st.code(MOBY_CONSOLE_SNIPPET, language=None)
+            st.caption(
+                "Both the bookmarklet and the snippet read the login token "
+                "your Moby tab already has, so no credentials are stored "
+                "here. If you never upload, the dashboard keeps working with "
+                "the bundled snapshot."
+            )
 
 # --------------------------------------------------------------------------- #
 # MEXC section
