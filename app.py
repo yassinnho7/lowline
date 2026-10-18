@@ -1,328 +1,580 @@
+"""Lowline Analytics Dashboard - corrected build (app2).
+
+Fixes compared to app.py
+------------------------
+1. 24H volume is now *real quote (USDT) volume* and is timeframe aware
+   (previously it summed 96 candles of base-asset volume and labelled it USDT).
+2. The sidebar volume filter actually removes assets from every tab.
+3. Ordering is deterministic (executor.map, stable sorts, tie-break by rank).
+4. Each tab has its own sorting options; Strategy 2 sorts numerically.
+5. Signals are always evaluated on the latest candle. The black-line offset is
+   visual only, exactly like Pine Script's plot(offset=...), and no longer
+   shifts price / SL / TP back in time.
+6. Risk/Reward is guarded against zero or negative risk and reward.
+7. Timeframe is a select box, so unsupported values can no longer silently
+   fall back to 60m.
+8. Fisher transform is the recursive version and RSI uses Wilder smoothing.
+9. HTTP calls are retried and cached; one failed asset cannot kill a scan.
+10. Assets with no usable data are listed separately instead of being shown
+    with fake zero prices/scores.
+"""
+
+from __future__ import annotations
+
 import concurrent.futures
+import threading
+import time
 from urllib.parse import quote
-from curl_cffi import requests as async_requests
+
 import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
+from curl_cffi import requests as curl_requests
 
-# Page Configuration
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+
 st.set_page_config(page_title="Lowline Analytics Dashboard", layout="wide")
 
 LISTING_API = "https://www.mexc.com/api/seo/coin/config/list"
 KLINES_API = "https://api.mexc.com/api/v3/klines"
+EXCHANGE_INFO_API = "https://api.mexc.com/api/v3/exchangeInfo"
+
+# MEXC only accepts these interval strings.
+TIMEFRAMES: dict[str, int] = {
+    "1m": 1,
+    "5m": 5,
+    "15m": 15,
+    "30m": 30,
+    "60m": 60,
+    "4h": 240,
+    "1d": 1440,
+    "1W": 10080,
+    "1M": 43200,
+}
+
+CANDLE_LIMIT = 200
+MAX_PARALLEL_REQUESTS = 8
+
+# Strategy 1 thresholds (editable from the UI).
+DEFAULT_PC_THRESHOLD = 5.0
+DEFAULT_FISHER_THRESHOLD = -2.1
+DEFAULT_CCI_THRESHOLD = -160.0
+
+# Strategy 1 indicator periods.
+PC_LOOKBACK = 100
+FISHER_PERIOD = 70
+TRIX_PERIOD = 15
+CCI_PERIOD = 40
+
+# Strategy 2 indicator periods.
+PC130_LOOKBACK = 130
+RSI_PERIOD = 14
+
+# Strategy 3 defaults (must match pinecode.txt).
+S3_LEFT_BARS = 8
+S3_RIGHT_BARS = 3
+S3_FALLBACK_LENGTH = 8
+S3_BLACK_LEFT = 16
+S3_BLACK_RIGHT = 2
+S3_BLACK_OFFSET = -2
+S3_STOP_LOSS_BUFFER = 0.985  # stop loss = support * 0.985
 
 
-def fetch_seo_listing_assets():
-    """Fetch top assets directly from SEO endpoint following exact listing order."""
-    try:
-        res = async_requests.get(
-            LISTING_API,
-            impersonate="chrome120",
-            headers={
-                "Referer": "https://www.mexc.com/price/new-crypto",
+# --------------------------------------------------------------------------- #
+# HTTP helpers
+# --------------------------------------------------------------------------- #
+
+_thread_state = threading.local()
+
+
+def _session() -> curl_requests.Session:
+    """One browser-impersonating session per worker thread."""
+    session = getattr(_thread_state, "session", None)
+    if session is None:
+        session = curl_requests.Session(impersonate="chrome120")
+        session.headers.update(
+            {
+                "Accept": "application/json, text/plain, */*",
                 "Accept-Language": "en-US,en;q=0.9",
-            },
-            timeout=15,
+            }
+        )
+        _thread_state.session = session
+    return session
+
+
+def _get(
+    url: str,
+    *,
+    params: dict | None = None,
+    headers: dict | None = None,
+    timeout: int = 20,
+    tries: int = 3,
+):
+    """GET with retries for transient failures. Returns a response or None."""
+    for attempt in range(tries):
+        try:
+            res = _session().get(
+                url, params=params, headers=headers, timeout=timeout
+            )
+        except Exception:  # noqa: BLE001 - network issues are reported upstream
+            time.sleep(0.4 * (attempt + 1))
+            continue
+        if res.status_code == 200:
+            return res
+        if res.status_code not in (429, 500, 502, 503, 504):
+            return res
+        time.sleep(0.6 * (attempt + 1))
+    return None
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_spot_pairs() -> dict[str, str]:
+    """Map base asset -> tradable USDT spot pair using MEXC exchangeInfo.
+
+    The SEO listing includes pre-market, delisted and futures-only coins, so
+    resolving real pairs avoids hundreds of "Invalid symbol" responses.
+    """
+    res = _get(EXCHANGE_INFO_API, timeout=30)
+    if res is None or res.status_code != 200:
+        return {}
+    try:
+        payload = res.json() or {}
+    except Exception:  # noqa: BLE001 - fall back to unvalidated symbols
+        return {}
+
+    pairs: dict[str, str] = {}
+    for item in payload.get("symbols", []):
+        if not isinstance(item, dict):
+            continue
+        if item.get("quoteAsset") != "USDT":
+            continue
+        if str(item.get("status")) != "1":
+            continue
+        if not item.get("isSpotTradingAllowed", True):
+            continue
+        base = str(item.get("baseAsset") or "").strip().upper()
+        pair = str(item.get("symbol") or "").strip().upper()
+        if base and pair:
+            pairs[base] = pair
+    return pairs
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_listing_assets() -> list[dict]:
+    """New listings from MEXC's SEO endpoint, resolved to real spot pairs."""
+    response = _get(
+        LISTING_API,
+        headers={"Referer": "https://www.mexc.com/price/new-crypto"},
+        timeout=20,
+    )
+    if response is None:
+        raise RuntimeError("Could not load the MEXC asset list (network error).")
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Could not load the MEXC asset list (HTTP {response.status_code})."
+        )
+    try:
+        payload = response.json() or {}
+    except Exception as exc:  # noqa: BLE001 - surfaced in the UI
+        raise RuntimeError(f"Could not parse the MEXC asset list ({exc}).") from exc
+
+    data = payload.get("data") or []
+    if isinstance(data, dict):
+        data = data.get("result") or data.get("list") or []
+    if not isinstance(data, list) or not data:
+        raise RuntimeError("Could not load the MEXC asset list (empty response).")
+
+    spot_pairs = fetch_spot_pairs()
+    validate_pairs = bool(spot_pairs)
+    rows: list[dict] = []
+    for idx, item in enumerate(data[:250], 1):
+        if not isinstance(item, dict):
+            continue
+        symbol_name = (
+            item.get("symbolName") or item.get("currency") or item.get("symbol")
+        )
+        if not symbol_name:
+            continue
+        base = str(symbol_name).strip().upper()
+        pair = spot_pairs.get(base)
+        has_spot = pair is not None if validate_pairs else True
+        if not pair:
+            pair = base if base.endswith("USDT") else f"{base}USDT"
+        full_name = item.get("symbolFullName") or base
+        is_hidden = bool(
+            item.get("hide", False)
+            or item.get("state") == "HIDE"
+            or not item.get("enableFetch", True)
+        )
+        rows.append(
+            {
+                "listing_rank": idx,
+                "symbol": base,
+                "pair": pair,
+                "has_spot": has_spot,
+                "full_name": full_name,
+                "is_hidden": is_hidden,
+                "chart_url": (
+                    "https://www.mexc.com/exchange/" f"{quote(base)}_USDT"
+                ),
+            }
         )
 
-        if res.status_code != 200:
-            st.error(f"HTTP Error {res.status_code} while fetching asset list.")
-            return []
+    if not rows:
+        raise RuntimeError("No valid symbols were found in the MEXC response.")
+    return rows
 
-        res_json = res.json()
-        data = res_json.get("data", [])
 
-        if isinstance(data, dict):
-            data = data.get("result") or data.get("list") or []
+@st.cache_data(ttl=60, show_spinner=False)
+def get_candles(pair: str, interval: str) -> list[dict]:
+    """Fetch OHLCV klines, including quote-asset volume (item[7]).
 
-        rows = []
-        for idx, item in enumerate(data[:250], 1):
-            symbol_name = (
-                item.get("symbolName") or item.get("currency") or item.get("symbol")
-            )
-            full_name = item.get("symbolFullName") or symbol_name
-            is_hidden = (
-                item.get("hide", False)
-                or item.get("state") == "HIDE"
-                or not item.get("enableFetch", True)
-            )
+    Returns a list sorted by open time. Empty list means no usable data.
+    """
+    if interval not in TIMEFRAMES:
+        raise ValueError(f"Unsupported timeframe: {interval}")
 
-            if symbol_name:
-                sym_clean = str(symbol_name).strip().upper()
-                chart_url = f"https://www.mexc.com/exchange/{quote(sym_clean)}_USDT"
+    symbol = str(pair).strip().upper()
+    if not symbol.endswith("USDT"):
+        symbol = f"{symbol}USDT"
 
-                rows.append(
-                    {
-                        "listing_rank": idx,
-                        "symbol": sym_clean,
-                        "full_name": full_name,
-                        "is_hidden": is_hidden,
-                        "chart_url": chart_url,
-                    }
-                )
-        return rows
-    except Exception as e:
-        st.error(f"Error fetching SEO list: {e}")
+    res = _get(
+        KLINES_API,
+        params={"symbol": symbol, "interval": interval, "limit": CANDLE_LIMIT},
+        timeout=12,
+    )
+    if res is None or res.status_code != 200:
+        return []
+    try:
+        data = res.json()
+    except Exception:  # noqa: BLE001 - one bad symbol must not break a scan
         return []
 
+    if not isinstance(data, list) or not data:
+        return []
 
-def get_candles(symbol, tf_str, target_bars=150):
-    """Fetch OHLCV klines with strict compliance to MEXC API supported intervals."""
-    clean_tf = tf_str.strip().lower()
-
-    # Mapping user input to MEXC official API accepted intervals
-    # MEXC officially supports: 1m, 5m, 15m, 30m, 60m, 4h, 1d, 1W, 1M
-    tf_mapping = {
-        "1m": "1m",
-        "5m": "5m",
-        "15m": "15m",
-        "30m": "30m",
-        "60m": "60m",
-        "1h": "60m",  # MEXC requires '60m' for 1 hour
-        "4h": "4h",
-        "1d": "1d",
-        "1w": "1W",
-        "1m_month": "1M",
-    }
-
-    api_tf = tf_mapping.get(clean_tf)
-    if not api_tf:
-        # Fallback for unsupported timeframes like 2h, defaulting safely to 60m
-        api_tf = "60m"
-
-    params = {"symbol": f"{symbol}USDT", "interval": api_tf, "limit": target_bars}
-    try:
-        res = requests.get(KLINES_API, params=params, timeout=4)
-        if res.status_code != 200:
-            return None
-        data = res.json()
-        if not data or not isinstance(data, list):
-            return None
-
-        bars = []
-        for item in data:
+    bars: list[dict] = []
+    for item in data:
+        try:
+            close = float(item[4])
+            base_volume = float(item[5])
+            # item[7] is quote-asset volume for MEXC/Binance-compatible klines.
+            quote_volume = (
+                float(item[7]) if len(item) > 7 and item[7] is not None else 0.0
+            )
+            if quote_volume <= 0:
+                quote_volume = base_volume * close
             bars.append(
                 {
-                    "t": item[0],
+                    "t": int(item[0]),
                     "o": float(item[1]),
                     "h": float(item[2]),
                     "l": float(item[3]),
-                    "c": float(item[4]),
-                    "v": float(item[5]),
+                    "c": close,
+                    "v": base_volume,
+                    "qv": quote_volume,
                 }
             )
-        return bars
-    except Exception:
+        except (TypeError, ValueError, IndexError):
+            continue
+
+    bars.sort(key=lambda bar: bar["t"])
+    return bars
+
+
+def estimate_24h_quote_volume(
+    pair: str, interval: str, bars: list[dict]
+) -> float:
+    """Real 24h USDT volume, independent of the selected timeframe."""
+    minutes = TIMEFRAMES[interval]
+    if minutes <= 1440:
+        bars_needed = max(1, int(round(1440 / minutes)))
+        return float(sum(bar["qv"] for bar in bars[-bars_needed:]))
+
+    daily = get_candles(pair, "1d")
+    if not daily:
+        return 0.0
+    # The last daily candle is the best 24h approximation on weekly/monthly.
+    return float(daily[-1]["qv"])
+
+
+# --------------------------------------------------------------------------- #
+# Indicators
+# --------------------------------------------------------------------------- #
+
+
+def ema(values: np.ndarray, period: int) -> np.ndarray:
+    """Exponential moving average (vectorized seed, exact recursion)."""
+    if values.size == 0:
+        return values
+    alpha = 2.0 / (period + 1.0)
+    out = np.empty_like(values, dtype=float)
+    out[0] = float(values[0])
+    for i in range(1, values.size):
+        out[i] = alpha * float(values[i]) + (1.0 - alpha) * out[i - 1]
+    return out
+
+
+def fisher_transform(
+    highs: np.ndarray, lows: np.ndarray, period: int = FISHER_PERIOD
+) -> np.ndarray:
+    """Recursive Fisher transform (Ehlers), clamped to +/-0.999."""
+    n = highs.size
+    fish = np.zeros(n, dtype=float)
+    value = 0.0
+    for i in range(n):
+        start = max(0, i - period + 1)
+        highest = float(np.max(highs[start : i + 1]))
+        lowest = float(np.min(lows[start : i + 1]))
+        spread = highest - lowest
+        mid = (float(highs[i]) + float(lows[i])) / 2.0
+        normalized = (mid - lowest) / spread if spread > 0 else 0.5
+        value = 0.66 * (normalized - 0.5) + 0.67 * value
+        value = max(min(value, 0.999), -0.999)
+        fish[i] = 0.5 * np.log((1.0 + value) / (1.0 - value))
+    return fish
+
+
+def wilder_rsi(closes: np.ndarray, period: int = RSI_PERIOD) -> float:
+    """RSI with Wilder smoothing; NaN when there is not enough history."""
+    if closes.size < period + 1:
+        return float("nan")
+    deltas = np.diff(closes)
+    gains = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+
+    avg_gain = float(np.mean(gains[:period]))
+    avg_loss = float(np.mean(losses[:period]))
+    for i in range(period, deltas.size):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def cci(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray) -> float:
+    """Commodity Channel Index over CCI_PERIOD bars."""
+    window = min(CCI_PERIOD, closes.size)
+    tp = (highs[-window:] + lows[-window:] + closes[-window:]) / 3.0
+    sma = float(np.mean(tp))
+    mad = float(np.mean(np.abs(tp - sma)))
+    if mad <= 0:
+        return 0.0
+    return (float(tp[-1]) - sma) / (0.015 * mad)
+
+
+def trix(closes: np.ndarray, period: int = TRIX_PERIOD) -> float:
+    """TRIX: 1-bar rate of change of a triple EMA, scaled by 10000."""
+    if closes.size < 3:
+        return 0.0
+    triple = ema(ema(ema(closes, period), period), period)
+    if triple[-2] == 0:
+        return 0.0
+    return (triple[-1] - triple[-2]) / triple[-2] * 10000.0
+
+
+# --------------------------------------------------------------------------- #
+# Strategies
+# --------------------------------------------------------------------------- #
+
+
+def calc_strategy_1(
+    bars: list[dict],
+    weights: dict[str, float],
+    pc_threshold: float = DEFAULT_PC_THRESHOLD,
+    fisher_threshold: float = DEFAULT_FISHER_THRESHOLD,
+    cci_threshold: float = DEFAULT_CCI_THRESHOLD,
+) -> dict | None:
+    """Weighted multi-factor score, always normalized to 0-100."""
+    if len(bars) < 40:
         return None
 
+    closes = np.array([b["c"] for b in bars], dtype=float)
+    lows = np.array([b["l"] for b in bars], dtype=float)
+    highs = np.array([b["h"] for b in bars], dtype=float)
 
-# --- STRATEGY 1 CALCULATION ---
-def calc_strategy_1(bars, w_pc, w_fisher, w_trix, w_cci):
-    if not bars or len(bars) < 40:
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    lookback = min(PC_LOOKBACK, lows.size)
+    floor = float(np.min(lows[-lookback:]))
+    pc_dist = (float(closes[-1]) / floor - 1.0) * 100.0 if floor > 0 else 999.0
 
-    closes = np.array([b["c"] for b in bars])
-    lows = np.array([b["l"] for b in bars])
-    highs = np.array([b["h"] for b in bars])
-    volumes = np.array([b["v"] for b in bars])
+    fisher_value = float(fisher_transform(highs, lows)[-1])
+    trix_value = trix(closes)
+    cci_value = cci(highs, lows, closes)
 
-    volume_24h = np.sum(volumes[-96:]) if len(volumes) >= 96 else np.sum(volumes)
-
-    lookback_pc = min(100, len(lows))
-    pc_lower = np.min(lows[-lookback_pc:])
-    pc_dist = ((closes[-1] / pc_lower) - 1.0) * 100.0 if pc_lower > 0 else 999.0
-    s_pc = w_pc if pc_dist <= 5.0 else 0.0
-
-    lookback_fish = min(70, len(lows))
-    hl2 = (highs[-lookback_fish:] + lows[-lookback_fish:]) / 2.0
-    min_l = np.min(lows[-lookback_fish:])
-    max_h = np.max(highs[-lookback_fish:])
-    raw_val = (hl2[-1] - min_l) / (max_h - min_l) if (max_h - min_l) > 0 else 0.5
-    val = max(min(0.66 * (raw_val - 0.5) + 0.5 * 0.5, 0.999), -0.999)
-    fisher = 0.5 * np.log((1.0 + val) / (1.0 - val))
-    s_fisher = w_fisher if fisher <= -2.1 else 0.0
-
-    def ema(data, period):
-        alpha = 2.0 / (period + 1.0)
-        res = np.zeros_like(data)
-        res[0] = data[0]
-        for i in range(1, len(data)):
-            res[i] = alpha * data[i] + (1.0 - alpha) * res[i - 1]
-        return res
-
-    e1 = ema(closes, 15)
-    e2 = ema(e1, 15)
-    e3 = ema(e2, 15)
-    trix = ((e3[-1] - e3[-2]) / e3[-2]) * 10000.0 if len(e3) > 1 and e3[-2] != 0 else 0.0
-    s_trix = w_trix if trix <= 0 else 0.0
-
-    lookback_cci = min(40, len(closes))
-    tp = (
-        highs[-lookback_cci:] + lows[-lookback_cci:] + closes[-lookback_cci:]
-    ) / 3.0
-    sma_tp = np.mean(tp)
-    mad = np.mean(np.abs(tp - sma_tp))
-    cci = (tp[-1] - sma_tp) / (0.015 * mad) if mad > 0 else 0.0
-    s_cci = w_cci if cci <= -160.0 else 0.0
-
-    score = round(s_pc + s_fisher + s_trix + s_cci, 1)
-    return (
-        closes[-1],
-        volume_24h,
-        score,
-        round(pc_dist, 2),
-        round(fisher, 2),
-        round(trix, 2),
-        round(cci, 1),
+    active = {
+        "pc": pc_dist <= pc_threshold,
+        "fisher": fisher_value <= fisher_threshold,
+        "trix": trix_value <= 0.0,
+        "cci": cci_value <= cci_threshold,
+    }
+    total_weight = sum(max(0.0, float(w)) for w in weights.values())
+    active_weight = sum(
+        max(0.0, float(weights[key]))
+        for key, is_active in active.items()
+        if is_active
     )
+    score = (active_weight / total_weight * 100.0) if total_weight > 0 else 0.0
+
+    signals = [name for name, is_active in active.items() if is_active]
+    return {
+        "price": float(closes[-1]),
+        "score": round(score, 1),
+        "pc_dist": round(pc_dist, 2),
+        "fisher": round(fisher_value, 2),
+        "trix": float(round(trix_value, 2)),
+        "cci": round(cci_value, 1),
+        "signals": signals,
+    }
 
 
-# --- STRATEGY 2 CALCULATION ---
-def calc_strategy_2(bars, pc_threshold, rsi_bottom_thresh):
-    if not bars or len(bars) < 40:
-        return 0.0, 0.0, "N/A", 0.0, 0.0
+def calc_strategy_2(
+    bars: list[dict], pc_threshold: float, rsi_threshold: float
+) -> dict | None:
+    """PC130 proximity + adaptive wave bottom + Wilder RSI channel bottom."""
+    if len(bars) < 40:
+        return None
 
-    closes = np.array([b["c"] for b in bars])
-    lows = np.array([b["l"] for b in bars])
-    highs = np.array([b["h"] for b in bars])
-    volumes = np.array([b["v"] for b in bars])
+    closes = np.array([b["c"] for b in bars], dtype=float)
+    lows = np.array([b["l"] for b in bars], dtype=float)
+    highs = np.array([b["h"] for b in bars], dtype=float)
 
-    volume_24h = np.sum(volumes[-96:]) if len(volumes) >= 96 else np.sum(volumes)
+    lookback = min(PC130_LOOKBACK, lows.size)
+    floor = float(np.min(lows[-lookback:]))
+    pc130_dist = (float(closes[-1]) / floor - 1.0) * 100.0 if floor > 0 else 999.0
 
-    lookback = min(130, len(lows))
-    min_130 = np.min(lows[-lookback:])
-    pc130_dist = ((closes[-1] / min_130) - 1.0) * 100.0 if min_130 > 0 else 999.0
-    pc_signal = pc130_dist <= pc_threshold
+    if closes.size >= 2:
+        true_range = np.maximum(
+            highs[1:] - lows[1:],
+            np.maximum(
+                np.abs(highs[1:] - closes[:-1]),
+                np.abs(lows[1:] - closes[:-1]),
+            ),
+        )
+        atr_window = min(PC130_LOOKBACK, true_range.size)
+        atr_value = float(np.mean(true_range[-atr_window:]))
+    else:
+        atr_value = 0.0
+    wave_bottom = floor + atr_value * 0.5
 
-    tr = np.maximum(
-        highs[1:] - lows[1:],
-        np.maximum(np.abs(highs[1:] - closes[:-1]), np.abs(lows[1:] - closes[:-1])),
-    )
-    atr130 = np.mean(tr[-lookback:]) if len(tr) >= lookback else np.mean(tr)
-    wave_bottom = min_130 + (atr130 * 0.5)
-    wave_signal = closes[-1] <= wave_bottom
-
-    rsi_lookback = min(85, len(closes) - 1)
-    deltas = np.diff(closes[-rsi_lookback - 1 :])
-    gains = np.where(deltas > 0, deltas, 0)
-    losses = np.where(deltas < 0, -deltas, 0)
-    avg_gain = np.mean(gains) if len(gains) > 0 else 0
-    avg_loss = np.mean(losses) if len(losses) > 0 else 0
-    rs = avg_gain / avg_loss if avg_loss > 0 else 100.0
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    rsi_signal = rsi <= rsi_bottom_thresh
+    rsi_value = wilder_rsi(closes)
 
     signals = []
-    if pc_signal:
+    if pc130_dist <= pc_threshold:
         signals.append("PC130")
-    if wave_signal:
+    if float(closes[-1]) <= wave_bottom:
         signals.append("Wave")
-    if rsi_signal:
-        signals.append("RSI Channel")
+    if np.isfinite(rsi_value) and rsi_value <= rsi_threshold:
+        signals.append("RSI")
 
-    status = f"TRIGGERED ({len(signals)})" if signals else "NEUTRAL"
-    return closes[-1], volume_24h, status, round(pc130_dist, 2), round(rsi, 1)
+    return {
+        "price": float(closes[-1]),
+        "pc130_dist": round(pc130_dist, 2),
+        "rsi": round(float(rsi_value), 1) if np.isfinite(rsi_value) else None,
+        "wave_bottom": round(wave_bottom, 8),
+        "signals": signals,
+        "signal_count": len(signals),
+        "status": f"TRIGGERED ({len(signals)}/3)" if signals else "NEUTRAL",
+    }
 
 
-# --- STRATEGY 3 CALCULATION (Dynamic Pivot Channel + Risk/Reward & SL/TP) ---
+def _is_pivot(
+    values: np.ndarray, index: int, left: int, right: int, find_low: bool
+) -> bool:
+    """Strict pivot: unique extreme inside its window (no flat-bottom repeats)."""
+    start = index - left
+    end = index + right + 1
+    if start < 0 or end > values.size:
+        return False
+    window = values[start:end]
+    value = values[index]
+    if np.count_nonzero(window == value) != 1:
+        return False
+    return value == (window.min() if find_low else window.max())
+
+
 def calc_strategy_3(
-    bars,
-    left_bars=8,
-    right_bars=3,
-    fallback_length=8,
-    black_left=16,
-    black_right=2,
-    black_offset=-2,
-    min_volume_usdt=10000.0,
-):
-    if not bars or len(bars) < 20:
-        return 0.0, 0.0, 0.0, "Low Data", 0.0, 0.0, 0.0, 0.0, 0.0, "Low Data"
+    bars: list[dict],
+    volume_24h: float,
+    left_bars: int = S3_LEFT_BARS,
+    right_bars: int = S3_RIGHT_BARS,
+    fallback_length: int = S3_FALLBACK_LENGTH,
+    black_left: int = S3_BLACK_LEFT,
+    black_right: int = S3_BLACK_RIGHT,
+    black_offset: int = S3_BLACK_OFFSET,
+    min_volume_usdt: float = 0.0,
+) -> dict | None:
+    """Dynamic pivot channel + stop loss / take profit / risk-reward."""
+    if len(bars) < 20:
+        return None
 
-    closes = np.array([b["c"] for b in bars])
-    lows = np.array([b["l"] for b in bars])
-    highs = np.array([b["h"] for b in bars])
-    volumes = np.array([b["v"] for b in bars])
+    closes = np.array([b["c"] for b in bars], dtype=float)
+    lows = np.array([b["l"] for b in bars], dtype=float)
+    highs = np.array([b["h"] for b in bars], dtype=float)
+    n = closes.size
 
-    volume_24h = np.sum(volumes[-96:]) if len(volumes) >= 96 else np.sum(volumes)
-    n = len(closes)
+    left_bars = max(1, int(left_bars))
+    right_bars = max(1, int(right_bars))
+    fallback_length = max(1, int(fallback_length))
+    black_left = max(1, int(black_left))
+    black_right = max(1, int(black_right))
 
-    vol_status = "Healthy" if volume_24h >= min_volume_usdt else "Low Liquidity ⚠️"
-
+    # --- main channel (confirmed pivots, step-held like Pine's var) ---
     sup_lines = np.full(n, np.nan)
     res_lines = np.full(n, np.nan)
     current_sup = np.nan
     current_res = np.nan
-
     for i in range(n):
         check_idx = i - right_bars
-        if check_idx >= left_bars:
-            w_lows = lows[check_idx - left_bars : check_idx + right_bars + 1]
-            if len(w_lows) == left_bars + right_bars + 1 and lows[check_idx] == np.min(
-                w_lows
-            ):
+        if check_idx >= 0:
+            if _is_pivot(lows, check_idx, left_bars, right_bars, True):
                 current_sup = lows[check_idx]
-
-            w_highs = highs[check_idx - left_bars : check_idx + right_bars + 1]
-            if len(w_highs) == left_bars + right_bars + 1 and highs[check_idx] == np.max(
-                w_highs
-            ):
+            if _is_pivot(highs, check_idx, left_bars, right_bars, False):
                 current_res = highs[check_idx]
-
         sup_lines[i] = current_sup
         res_lines[i] = current_res
 
-    smart_sup = np.min(lows[-min(fallback_length, len(lows)) :])
-    smart_res = np.max(highs[-min(fallback_length, len(highs)) :])
-
+    smart_sup = float(np.min(lows[-min(fallback_length, n) :]))
+    smart_res = float(np.max(highs[-min(fallback_length, n) :]))
     final_sup = np.where(np.isnan(sup_lines), smart_sup, sup_lines)
     final_res = np.where(np.isnan(res_lines), smart_res, res_lines)
 
+    # --- black structure line ---
     black_steps = np.full(n, np.nan)
     current_black = np.nan
     for i in range(n):
-        check_idx_b = i - black_right
-        p_low_b = False
-        p_high_b = False
-        val_low = np.nan
-        val_high = np.nan
-        if check_idx_b >= black_left:
-            w_lows = lows[check_idx_b - black_left : check_idx_b + black_right + 1]
-            if len(w_lows) == black_left + black_right + 1 and lows[check_idx_b] == np.min(
-                w_lows
-            ):
-                val_low = lows[check_idx_b]
-                p_low_b = True
+        check_idx = i - black_right
+        if check_idx >= 0:
+            if _is_pivot(lows, check_idx, black_left, black_right, True):
+                current_black = lows[check_idx]
+            elif _is_pivot(highs, check_idx, black_left, black_right, False):
+                current_black = highs[check_idx]
+        black_steps[i] = (
+            final_sup[i] if np.isnan(current_black) else current_black
+        )
 
-            w_highs = highs[check_idx_b - black_left : check_idx_b + black_right + 1]
-            if len(w_highs) == black_left + black_right + 1 and highs[check_idx_b] == np.max(
-                w_highs
-            ):
-                val_high = highs[check_idx_b]
-                p_high_b = True
+    # Pine's plot(offset=...) only moves the drawing; it does not move signals.
+    black_shifted = np.full(n, np.nan)
+    for i in range(n):
+        source = i - black_offset
+        if 0 <= source < n:
+            black_shifted[i] = black_steps[source]
 
-        if p_low_b:
-            current_black = val_low
-        elif p_high_b:
-            current_black = val_high
-
-        if np.isnan(current_black):
-            current_black = final_sup[i]
-
-        black_steps[i] = current_black
-
-    eval_idx = n - 1 + black_offset
-    eval_idx = max(0, min(eval_idx, n - 1))
-
-    last_close = closes[eval_idx]
-    last_sup = final_sup[eval_idx]
-    last_res = final_res[eval_idx]
+    # --- evaluate on the latest candle ---
+    last_close = float(closes[-1])
+    last_sup = float(final_sup[-1])
+    last_res = float(final_res[-1])
+    finite_black = black_shifted[np.isfinite(black_shifted)]
+    last_black = float(finite_black[-1]) if finite_black.size else None
 
     sup_dist = (
-        ((last_close - last_sup) / last_sup) * 100.0 if last_sup > 0 else 999.0
+        (last_close / last_sup - 1.0) * 100.0 if last_sup > 0 else 999.0
     )
 
-    score = 0.0
     if sup_dist <= 0.5:
         score = 100.0
     elif sup_dist <= 2.0:
@@ -334,399 +586,690 @@ def calc_strategy_3(
     else:
         score = max(0.0, 100.0 - sup_dist * 3.0)
 
-    status = (
-        "BUY SETUP (TRUE TOUCH)"
-        if sup_dist <= 2.0
-        else ("NEAR SUPPORT" if sup_dist <= 5.0 else "NEUTRAL")
-    )
+    if sup_dist <= 2.0:
+        status = "BUY SETUP (TRUE TOUCH)"
+    elif sup_dist <= 5.0:
+        status = "NEAR SUPPORT"
+    else:
+        status = "NEUTRAL"
 
-    stop_loss = round(last_sup * 0.985, 6)
-    take_profit = round(last_res, 6)
-
+    stop_loss = last_sup * S3_STOP_LOSS_BUFFER
+    take_profit = last_res
     risk = last_close - stop_loss
     reward = take_profit - last_close
-    rr_ratio = round(reward / risk, 2) if risk > 0 else 0.0
+    risk_pct = (risk / last_close * 100.0) if last_close > 0 else 0.0
+    tp_pct = (reward / last_close * 100.0) if last_close > 0 else 0.0
+    rr_ratio = (reward / risk) if (risk > 0 and reward > 0) else 0.0
 
-    return (
-        last_close,
-        volume_24h,
-        round(score, 1),
-        status,
-        round(last_sup, 6),
-        round(last_res, 6),
-        stop_loss,
-        take_profit,
-        rr_ratio,
-        vol_status,
+    return {
+        "price": last_close,
+        "score": round(score, 1),
+        "status": status,
+        "support": round(last_sup, 8),
+        "resistance": round(last_res, 8),
+        "black_line": round(last_black, 8) if last_black is not None else None,
+        "stop_loss": round(stop_loss, 8),
+        "take_profit": round(take_profit, 8),
+        "risk_pct": round(risk_pct, 2),
+        "tp_pct": round(tp_pct, 2),
+        "rr": round(rr_ratio, 2),
+        "volume_24h": volume_24h,
+        "vol_status": (
+            "Healthy" if volume_24h >= min_volume_usdt else "Low liquidity"
+        ),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Scan plumbing
+# --------------------------------------------------------------------------- #
+
+
+def run_scan(worker, assets: list[dict], max_workers: int) -> tuple[list[dict], int, int]:
+    """Run worker(item) in parallel. Returns (rows, skipped, failed).
+
+    executor.map keeps the listing order, so the default view is deterministic
+    even though requests finish out of order.
+    """
+
+    def guarded(item: dict):
+        try:
+            return "ok", worker(item)
+        except Exception as exc:  # noqa: BLE001 - isolate per-asset failures
+            return "error", str(exc)
+
+    rows: list[dict] = []
+    skipped = 0
+    failed = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for status, payload in executor.map(guarded, assets):
+            if status == "error":
+                failed += 1
+                continue
+            if payload is None:
+                skipped += 1
+                continue
+            rows.append(payload)
+    return rows, skipped, failed
+
+
+def sort_rows(rows: list[dict], key: str, reverse: bool = True) -> list[dict]:
+    """Stable sort with listing rank as the deterministic tie-breaker."""
+    rows.sort(key=lambda row: row["#"])
+    if key:
+        rows.sort(key=lambda row: row[key], reverse=reverse)
+    return rows
+
+
+def strip_internal(rows: list[dict]) -> pd.DataFrame:
+    """Drop helper keys and build the display DataFrame."""
+    cleaned = [
+        {key: value for key, value in row.items() if not key.startswith("_")}
+        for row in rows
+    ]
+    return pd.DataFrame(cleaned)
+
+
+def fmt_signals(signals: list[str]) -> str:
+    pretty = {
+        "pc": "PC",
+        "fisher": "Fisher",
+        "trix": "TRIX",
+        "cci": "CCI",
+        "PC130": "PC130",
+        "Wave": "Wave",
+        "RSI": "RSI",
+    }
+    return " + ".join(pretty.get(name, name) for name in signals) if signals else "-"
+
+
+def pc_zone(pc_dist: float) -> str:
+    if pc_dist <= 0.0:
+        return "🟢 At/below floor"
+    if pc_dist <= 5.0:
+        return "🟠 Near floor"
+    return "🔴 Far from floor"
+
+
+def render_tab(
+    rows: list[dict],
+    total_assets: int,
+    skipped: int,
+    failed: int,
+    column_config: dict,
+    caption: str,
+) -> None:
+    if failed:
+        st.warning(f"{failed} asset(s) could not be processed and were skipped.")
+    st.success(
+        f"Showing {len(rows)} of {total_assets} assets "
+        f"({skipped} excluded by filters, {failed} failed)."
     )
+    if not rows:
+        st.info(
+            "No asset passed the current filters. Lower the minimum 24H "
+            "volume or increase the scan limit."
+        )
+        return
+    st.dataframe(
+        strip_internal(rows),
+        width="stretch",
+        hide_index=True,
+        column_config=column_config,
+    )
+    st.caption(caption)
 
 
-# --- STYLING HIGHLIGHT FUNCTION FOR S1 ---
-def style_strategy_1(df):
-    def highlight_cols(row):
-        styles = [""] * len(row)
-        pc = row["PC Dist %"]
-        if pd.notnull(pc):
-            if pc <= 0.0:
-                styles[df.columns.get_loc("PC Dist %")] = (
-                    "background-color: #1e4620; color: #a3f7a1; font-weight: bold;"
-                )
-            elif pc <= 5.0:
-                styles[df.columns.get_loc("PC Dist %")] = (
-                    "background-color: #5c3800; color: #ffca7a; font-weight: bold;"
-                )
-            else:
-                styles[df.columns.get_loc("PC Dist %")] = (
-                    "background-color: #4a1919; color: #f28b8b;"
-                )
-        return styles
+# --------------------------------------------------------------------------- #
+# UI
+# --------------------------------------------------------------------------- #
 
-    return df.style.apply(highlight_cols, axis=1)
-
-
-# --- USER INTERFACE ---
 st.title("Lowline Analytics Dashboard")
-
-st.sidebar.header("Global Configurations")
-custom_tf = st.sidebar.text_input(
-    "Timeframe (Supported: 15m, 30m, 60m / 1h, 4h, 1d):", value="60m"
-)
-max_scan_limit = st.sidebar.slider(
-    "Filter: Max New Listings to Scan", min_value=10, max_value=250, value=100, step=10
-)
-min_vol_filter = st.sidebar.number_input(
-    "Min 24H Volume Filter (USDT)", value=50000.0, step=10000.0
+st.caption(
+    "Live data from MEXC public endpoints. Research tool only - "
+    "not financial advice."
 )
 
-sort_option = st.sidebar.selectbox(
-    "Sort Results By:",
-    options=[
-        "Listing Sequence (Default)",
-        "Strategy Score (Highest to Lowest)",
-        "Risk/Reward Ratio (Best R:R)",
-        "Price (High to Low)",
-        "Price (Low to High)",
-        "Symbol Name (A-Z)",
-    ],
-)
+with st.sidebar:
+    st.header("Global Settings")
+    timeframe = st.selectbox(
+        "Timeframe",
+        options=list(TIMEFRAMES.keys()),
+        index=list(TIMEFRAMES.keys()).index("60m"),
+        help="Candle interval used for every indicator.",
+    )
+    max_scan_limit = st.slider(
+        "Max new listings to scan",
+        min_value=10,
+        max_value=250,
+        value=100,
+        step=10,
+    )
+    min_vol_filter = st.number_input(
+        "Minimum 24H volume (USDT)",
+        min_value=0.0,
+        value=50000.0,
+        step=10000.0,
+        help=(
+            "Real quote volume over the last 24 hours. Assets below this "
+            "value are hidden from every tab."
+        ),
+    )
+    st.caption(
+        "Volume is measured in USDT from quote-asset volume, not base-asset "
+        "units."
+    )
 
 tab1, tab2, tab3 = st.tabs(
     [
         "Strategy 1 (Quantitative Score)",
         "Strategy 2 (Pine Technical View)",
-        "Strategy 3 (Dynamic Pivot Channel + Risk Management)",
+        "Strategy 3 (Dynamic Channel + Risk)",
     ]
 )
 
-# ================= TAB 1 =================
+# ------------------------------- TAB 1 ------------------------------------- #
+
 with tab1:
     st.subheader("Strategy 1 - Quantitative Multi-Factor Score")
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        w_pc = st.number_input("PC Weight %", value=40, key="s1_pc")
-    with col2:
-        w_fisher = st.number_input("Fisher Weight %", value=30, key="s1_fish")
-    with col3:
-        w_trix = st.number_input("TRIX Weight %", value=20, key="s1_trix")
-    with col4:
-        w_cci = st.number_input("CCI Weight %", value=10, key="s1_cci")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        w_pc = st.number_input("PC weight", value=40, min_value=0, key="s1_pc")
+    with c2:
+        w_fisher = st.number_input(
+            "Fisher weight", value=30, min_value=0, key="s1_fish"
+        )
+    with c3:
+        w_trix = st.number_input("TRIX weight", value=20, min_value=0, key="s1_trix")
+    with c4:
+        w_cci = st.number_input("CCI weight", value=10, min_value=0, key="s1_cci")
+
+    with st.expander("Signal thresholds"):
+        t1, t2, t3 = st.columns(3)
+        with t1:
+            pc_threshold = st.number_input(
+                "PC proximity threshold (%)",
+                value=DEFAULT_PC_THRESHOLD,
+                min_value=0.0,
+                key="s1_pc_thresh",
+            )
+        with t2:
+            fisher_threshold = st.number_input(
+                "Fisher threshold",
+                value=DEFAULT_FISHER_THRESHOLD,
+                key="s1_fish_thresh",
+            )
+        with t3:
+            cci_threshold = st.number_input(
+                "CCI threshold",
+                value=DEFAULT_CCI_THRESHOLD,
+                key="s1_cci_thresh",
+            )
+
+    sort_s1 = st.selectbox(
+        "Sort results by",
+        options=[
+            "Listing sequence",
+            "Score (high to low)",
+            "PC distance (closest first)",
+            "Price (high to low)",
+            "Price (low to high)",
+            "Symbol (A-Z)",
+        ],
+        key="sort_s1",
+    )
+
+    sort_keys_s1 = {
+        "Listing sequence": (None, True),
+        "Score (high to low)": ("Score", True),
+        "PC distance (closest first)": ("_raw_pc", False),
+        "Price (high to low)": ("_raw_price", True),
+        "Price (low to high)": ("_raw_price", False),
+        "Symbol (A-Z)": ("_raw_symbol", False),
+    }
 
     if st.button("Run Strategy 1 Scan", type="primary", key="btn_s1"):
-        with st.spinner("Fetching assets directly from SEO endpoint..."):
-            assets = fetch_seo_listing_assets()[:max_scan_limit]
+        try:
+            with st.spinner("Loading assets..."):
+                assets = fetch_listing_assets()[:max_scan_limit]
+        except RuntimeError as exc:
+            st.error(str(exc))
+        else:
+            weights = {
+                "pc": w_pc,
+                "fisher": w_fisher,
+                "trix": w_trix,
+                "cci": w_cci,
+            }
 
-            if assets:
-                results = []
-
-                def worker_s1(item):
-                    symbol = item["symbol"]
-                    full_name = item["full_name"]
-                    is_hidden = item["is_hidden"]
-                    bars = get_candles(symbol, custom_tf)
-
-                    if is_hidden or not bars:
-                        display_sym = f"⚠️ {symbol} ({full_name})"
-                        price_num, vol_24h, score, pc, fish, trix, cci = (
-                            0.0,
-                            0.0,
-                            0.0,
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                        price_str = "N/A"
-                    else:
-                        display_sym = f"{symbol} ({full_name})"
-                        (
-                            price_num,
-                            vol_24h,
-                            score,
-                            pc,
-                            fish,
-                            trix,
-                            cci,
-                        ) = calc_strategy_1(
-                            bars, w_pc, w_fisher, w_trix, w_cci
-                        )
-                        price_str = f"${price_num:.6f}"
-
-                    return {
-                        "#": item["listing_rank"],
-                        "Symbol": display_sym,
-                        "Chart Link": item["chart_url"],
-                        "Price": price_str,
-                        "_raw_price": price_num,
-                        "24H Amount (USDT)": f"${vol_24h:,.2f}",
-                        "Setup Score / 100": score,
-                        "PC Dist %": pc,
-                        "Fisher": fish,
-                        "TRIX": trix,
-                        "CCI": cci,
-                    }
-
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=10
-                ) as executor:
-                    futures = [executor.submit(worker_s1, item) for item in assets]
-                    for future in concurrent.futures.as_completed(futures):
-                        results.append(future.result())
-
-                if sort_option == "Listing Sequence (Default)":
-                    results.sort(key=lambda x: x["#"])
-                elif sort_option == "Strategy Score (Highest to Lowest)":
-                    results.sort(key=lambda x: x["Setup Score / 100"], reverse=True)
-                elif sort_option == "Price (High to Low)":
-                    results.sort(key=lambda x: x["_raw_price"], reverse=True)
-                elif sort_option == "Price (Low to High)":
-                    results.sort(key=lambda x: x["_raw_price"])
-                elif sort_option == "Symbol Name (A-Z)":
-                    results.sort(key=lambda x: x["Symbol"])
-
-                for r in results:
-                    del r["_raw_price"]
-
-                df_s1 = pd.DataFrame(results)
-                styled_df = style_strategy_1(df_s1)
-
-                st.success(
-                    f"Successfully processed {len(results)} assets based on your filter!"
+            def worker_s1(item: dict) -> dict | None:
+                symbol = item["symbol"]
+                bars = (
+                    []
+                    if item["is_hidden"] or not item["has_spot"]
+                    else get_candles(item["pair"], timeframe)
                 )
-                st.dataframe(
-                    styled_df,
-                    use_container_width=True,
-                    column_config={
-                        "Chart Link": st.column_config.LinkColumn(
-                            "Symbol Link", display_text="View Chart"
-                        )
-                    },
+                if not bars:
+                    return None
+                volume = estimate_24h_quote_volume(
+                    item["pair"], timeframe, bars
+                )
+                if volume < min_vol_filter:
+                    return None
+                result = calc_strategy_1(
+                    bars, weights, pc_threshold, fisher_threshold, cci_threshold
+                )
+                if result is None:
+                    return None
+                return {
+                    "#": item["listing_rank"],
+                    "Symbol": f"{symbol} ({item['full_name']})",
+                    "Chart": item["chart_url"],
+                    "Price": result["price"],
+                    "24H Vol (USDT)": volume,
+                    "Score": result["score"],
+                    "Zone": pc_zone(result["pc_dist"]),
+                    "PC Dist %": result["pc_dist"],
+                    "Fisher": result["fisher"],
+                    "TRIX": result["trix"],
+                    "CCI": result["cci"],
+                    "Signals": fmt_signals(result["signals"]),
+                    "_raw_price": result["price"],
+                    "_raw_pc": result["pc_dist"],
+                    "_raw_symbol": symbol,
+                }
+
+            with st.spinner(
+                f"Scanning {len(assets)} assets on {timeframe}..."
+            ):
+                rows, skipped, failed = run_scan(
+                    worker_s1, assets, MAX_PARALLEL_REQUESTS
                 )
 
-# ================= TAB 2 =================
+            st.session_state["s1_result"] = {
+                "rows": rows,
+                "total": len(assets),
+                "skipped": skipped,
+                "failed": failed,
+                "timeframe": timeframe,
+            }
+
+    stored_s1 = st.session_state.get("s1_result")
+    if stored_s1:
+        key, reverse = sort_keys_s1[sort_s1]
+        sort_rows(stored_s1["rows"], key, reverse)
+        render_tab(
+            stored_s1["rows"],
+            stored_s1["total"],
+            stored_s1["skipped"],
+            stored_s1["failed"],
+            column_config={
+                "Chart": st.column_config.LinkColumn(
+                    "Chart", display_text="Open chart"
+                ),
+                "Price": st.column_config.NumberColumn(
+                    "Price (USDT)", format="$%.6f"
+                ),
+                "24H Vol (USDT)": st.column_config.NumberColumn(
+                    "24H Vol (USDT)", format="$%.0f"
+                ),
+                "Score": st.column_config.ProgressColumn(
+                    "Score / 100", min_value=0, max_value=100, format="%.1f"
+                ),
+                "PC Dist %": st.column_config.NumberColumn(
+                    "PC Dist %", format="%.2f%%"
+                ),
+                "Fisher": st.column_config.NumberColumn(
+                    "Fisher", format="%.2f"
+                ),
+                "TRIX": st.column_config.NumberColumn("TRIX", format="%.2f"),
+                "CCI": st.column_config.NumberColumn("CCI", format="%.1f"),
+            },
+            caption=(
+                "Score = active weights / total weights x 100. "
+                "Fisher is the recursive Ehlers transform; RSI on the next "
+                "tab uses Wilder smoothing."
+            ),
+        )
+        st.caption(f"Last scan ran on the {stored_s1['timeframe']} timeframe.")
+
+# ------------------------------- TAB 2 ------------------------------------- #
+
 with tab2:
     st.subheader(
         "Strategy 2 - PC130 Proximity + Adaptive Wave + RSI Channel Bottom"
     )
-    col1, col2 = st.columns(2)
-    with col1:
+    c1, c2 = st.columns(2)
+    with c1:
         pc_thresh = st.number_input(
-            "PC130 Proximity Threshold (%)", value=3.0, key="s2_pc"
+            "PC130 proximity threshold (%)", value=3.0, min_value=0.0, key="s2_pc"
         )
-    with col2:
+    with c2:
         rsi_bottom = st.number_input(
-            "RSI Channel Bottom Threshold", value=30.0, key="s2_rsi"
+            "RSI bottom threshold",
+            value=30.0,
+            min_value=0.0,
+            max_value=100.0,
+            key="s2_rsi",
         )
+
+    sort_s2 = st.selectbox(
+        "Sort results by",
+        options=[
+            "Listing sequence",
+            "Signals (most first)",
+            "PC130 distance (closest first)",
+            "RSI (lowest first)",
+            "Price (high to low)",
+            "Price (low to high)",
+            "Symbol (A-Z)",
+        ],
+        key="sort_s2",
+    )
+
+    sort_keys_s2 = {
+        "Listing sequence": (None, True),
+        "Signals (most first)": ("_raw_signals", True),
+        "PC130 distance (closest first)": ("_raw_pc", False),
+        "RSI (lowest first)": ("_raw_rsi", False),
+        "Price (high to low)": ("_raw_price", True),
+        "Price (low to high)": ("_raw_price", False),
+        "Symbol (A-Z)": ("_raw_symbol", False),
+    }
 
     if st.button("Run Strategy 2 Scan", type="primary", key="btn_s2"):
-        with st.spinner("Fetching assets directly from SEO endpoint..."):
-            assets = fetch_seo_listing_assets()[:max_scan_limit]
+        try:
+            with st.spinner("Loading assets..."):
+                assets = fetch_listing_assets()[:max_scan_limit]
+        except RuntimeError as exc:
+            st.error(str(exc))
+        else:
 
-            if assets:
-                results = []
-
-                def worker_s2(item):
-                    symbol = item["symbol"]
-                    full_name = item["full_name"]
-                    is_hidden = item["is_hidden"]
-                    bars = get_candles(symbol, custom_tf)
-
-                    if is_hidden or not bars:
-                        display_sym = f"⚠️ {symbol} ({full_name})"
-                        price_num, vol_24h = 0.0, 0.0
-                        price_str, status, pc130, rsi = "N/A", "N/A", None, None
-                    else:
-                        display_sym = f"{symbol} ({full_name})"
-                        (
-                            price_num,
-                            vol_24h,
-                            status,
-                            pc130,
-                            rsi,
-                        ) = calc_strategy_2(bars, pc_thresh, rsi_bottom)
-                        price_str = f"${price_num:.6f}"
-
-                    return {
-                        "#": item["listing_rank"],
-                        "Symbol": display_sym,
-                        "Chart Link": item["chart_url"],
-                        "Price": price_str,
-                        "_raw_price": price_num,
-                        "24H Amount (USDT)": f"${vol_24h:,.2f}",
-                        "Technical Status": status,
-                        "PC130 Dist %": pc130,
-                        "RSI Channel": rsi,
-                    }
-
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=10
-                ) as executor:
-                    futures = [executor.submit(worker_s2, item) for item in assets]
-                    for future in concurrent.futures.as_completed(futures):
-                        results.append(future.result())
-
-                if sort_option == "Listing Sequence (Default)":
-                    results.sort(key=lambda x: x["#"])
-                elif sort_option == "Strategy Score (Highest to Lowest)":
-                    results.sort(key=lambda x: x["Technical Status"], reverse=True)
-                elif sort_option == "Price (High to Low)":
-                    results.sort(key=lambda x: x["_raw_price"], reverse=True)
-                elif sort_option == "Price (Low to High)":
-                    results.sort(key=lambda x: x["_raw_price"])
-                elif sort_option == "Symbol Name (A-Z)":
-                    results.sort(key=lambda x: x["Symbol"])
-
-                for r in results:
-                    del r["_raw_price"]
-
-                df_s2 = pd.DataFrame(results)
-
-                st.success(
-                    f"Successfully processed {len(results)} assets based on your filter!"
+            def worker_s2(item: dict) -> dict | None:
+                symbol = item["symbol"]
+                bars = (
+                    []
+                    if item["is_hidden"] or not item["has_spot"]
+                    else get_candles(item["pair"], timeframe)
                 )
-                st.dataframe(
-                    df_s2,
-                    use_container_width=True,
-                    column_config={
-                        "Chart Link": st.column_config.LinkColumn(
-                            "Symbol Link", display_text="View Chart"
-                        )
-                    },
+                if not bars:
+                    return None
+                volume = estimate_24h_quote_volume(
+                    item["pair"], timeframe, bars
+                )
+                if volume < min_vol_filter:
+                    return None
+                result = calc_strategy_2(bars, pc_thresh, rsi_bottom)
+                if result is None:
+                    return None
+                return {
+                    "#": item["listing_rank"],
+                    "Symbol": f"{symbol} ({item['full_name']})",
+                    "Chart": item["chart_url"],
+                    "Price": result["price"],
+                    "24H Vol (USDT)": volume,
+                    "Status": result["status"],
+                    "Signals": fmt_signals(result["signals"]),
+                    "PC130 Dist %": result["pc130_dist"],
+                    "RSI": result["rsi"],
+                    "Wave Bottom": result["wave_bottom"],
+                    "_raw_price": result["price"],
+                    "_raw_signals": result["signal_count"],
+                    "_raw_pc": result["pc130_dist"],
+                    "_raw_rsi": (
+                        result["rsi"] if result["rsi"] is not None else 999.0
+                    ),
+                    "_raw_symbol": symbol,
+                }
+
+            with st.spinner(
+                f"Scanning {len(assets)} assets on {timeframe}..."
+            ):
+                rows, skipped, failed = run_scan(
+                    worker_s2, assets, MAX_PARALLEL_REQUESTS
                 )
 
-# ================= TAB 3 =================
+            st.session_state["s2_result"] = {
+                "rows": rows,
+                "total": len(assets),
+                "skipped": skipped,
+                "failed": failed,
+                "timeframe": timeframe,
+            }
+
+    stored_s2 = st.session_state.get("s2_result")
+    if stored_s2:
+        key, reverse = sort_keys_s2[sort_s2]
+        sort_rows(stored_s2["rows"], key, reverse)
+        render_tab(
+            stored_s2["rows"],
+            stored_s2["total"],
+            stored_s2["skipped"],
+            stored_s2["failed"],
+            column_config={
+                "Chart": st.column_config.LinkColumn(
+                    "Chart", display_text="Open chart"
+                ),
+                "Price": st.column_config.NumberColumn(
+                    "Price (USDT)", format="$%.6f"
+                ),
+                "24H Vol (USDT)": st.column_config.NumberColumn(
+                    "24H Vol (USDT)", format="$%.0f"
+                ),
+                "PC130 Dist %": st.column_config.NumberColumn(
+                    "PC130 Dist %", format="%.2f%%"
+                ),
+                "RSI": st.column_config.NumberColumn("RSI", format="%.1f"),
+                "Wave Bottom": st.column_config.NumberColumn(
+                    "Wave Bottom", format="$%.6f"
+                ),
+            },
+            caption=(
+                "Signals are evaluated on the latest candle. "
+                "Wave bottom = 130-bar low + 0.5 x ATR(130)."
+            ),
+        )
+        st.caption(f"Last scan ran on the {stored_s2['timeframe']} timeframe.")
+
+# ------------------------------- TAB 3 ------------------------------------- #
+
 with tab3:
     st.subheader(
         "Strategy 3 - Dynamic Pivot Channel + Risk Management (SL, TP, R:R)"
     )
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        s3_left = st.number_input("Channel Left Bars", value=8, key="s3_l")
-        s3_black_left = st.number_input("Black Line Left Bars", value=16, key="s3_bl")
-    with col2:
-        s3_right = st.number_input("Channel Right Bars", value=3, key="s3_r")
-        s3_black_right = st.number_input("Black Line Right Bars", value=2, key="s3_br")
-    with col3:
-        s3_fallback = st.number_input("Fallback Length", value=8, key="s3_fb")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        s3_left = st.number_input(
+            "Channel left bars", value=S3_LEFT_BARS, min_value=1, key="s3_l"
+        )
+        s3_black_left = st.number_input(
+            "Black line left bars",
+            value=S3_BLACK_LEFT,
+            min_value=1,
+            key="s3_bl",
+        )
+    with c2:
+        s3_right = st.number_input(
+            "Channel right bars", value=S3_RIGHT_BARS, min_value=1, key="s3_r"
+        )
+        s3_black_right = st.number_input(
+            "Black line right bars",
+            value=S3_BLACK_RIGHT,
+            min_value=1,
+            key="s3_br",
+        )
+    with c3:
+        s3_fallback = st.number_input(
+            "Fallback length", value=S3_FALLBACK_LENGTH, min_value=1, key="s3_fb"
+        )
         s3_offset = st.number_input(
-            "Black Line Shift (Offset)", value=-2, key="s3_off"
+            "Black line shift (visual only)",
+            value=S3_BLACK_OFFSET,
+            min_value=-20,
+            max_value=20,
+            key="s3_off",
+            help=(
+                "Matches Pine's plot(offset=...). It moves the black line only; "
+                "price, support, SL, TP and R:R are always computed on the "
+                "latest candle."
+            ),
         )
 
+    sort_s3 = st.selectbox(
+        "Sort results by",
+        options=[
+            "Listing sequence",
+            "Score (high to low)",
+            "Risk/Reward (best first)",
+            "Distance to support (closest first)",
+            "Price (high to low)",
+            "Price (low to high)",
+            "Symbol (A-Z)",
+        ],
+        key="sort_s3",
+    )
+
+    sort_keys_s3 = {
+        "Listing sequence": (None, True),
+        "Score (high to low)": ("Score", True),
+        "Risk/Reward (best first)": ("_raw_rr", True),
+        "Distance to support (closest first)": ("_raw_sup_dist", False),
+        "Price (high to low)": ("_raw_price", True),
+        "Price (low to high)": ("_raw_price", False),
+        "Symbol (A-Z)": ("_raw_symbol", False),
+    }
+
     if st.button("Run Strategy 3 Scan", type="primary", key="btn_s3"):
-        with st.spinner(
-            "Fetching assets & calculating Dynamic Channels, SL, TP & R:R..."
-        ):
-            assets = fetch_seo_listing_assets()[:max_scan_limit]
+        try:
+            with st.spinner("Loading assets..."):
+                assets = fetch_listing_assets()[:max_scan_limit]
+        except RuntimeError as exc:
+            st.error(str(exc))
+        else:
 
-            if assets:
-                results = []
-
-                def worker_s3(item):
-                    symbol = item["symbol"]
-                    full_name = item["full_name"]
-                    is_hidden = item["is_hidden"]
-                    bars = get_candles(symbol, custom_tf)
-
-                    if is_hidden or not bars:
-                        display_sym = f"⚠️ {symbol} ({full_name})"
-                        price_num, vol_24h, score = 0.0, 0.0, 0.0
-                        price_str, status = "N/A", "N/A"
-                        sup_val, res_val, sl, tp, rr = 0.0, 0.0, 0.0, 0.0, 0.0
-                        vol_status = "N/A"
-                    else:
-                        display_sym = f"{symbol} ({full_name})"
-                        (
-                            price_num,
-                            vol_24h,
-                            score,
-                            status,
-                            sup_val,
-                            res_val,
-                            sl,
-                            tp,
-                            rr,
-                            vol_status,
-                        ) = calc_strategy_3(
-                            bars,
-                            int(s3_left),
-                            int(s3_right),
-                            int(s3_fallback),
-                            int(s3_black_left),
-                            int(s3_black_right),
-                            int(s3_offset),
-                            min_vol_filter,
-                        )
-                        price_str = f"${price_num:.6f}"
-
-                    return {
-                        "#": item["listing_rank"],
-                        "Symbol": display_sym,
-                        "Chart Link": item["chart_url"],
-                        "Price": price_str,
-                        "_raw_price": price_num,
-                        "24H Amount (USDT)": f"${vol_24h:,.2f}",
-                        "Setup Score / 100": score,
-                        "Status": status,
-                        "Dynamic Support": sup_val,
-                        "Stop Loss (SL)": sl,
-                        "Take Profit (TP)": tp,
-                        "Risk/Reward (R:R)": rr,
-                        "Liquidity": vol_status,
-                    }
-
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=10
-                ) as executor:
-                    futures = [executor.submit(worker_s3, item) for item in assets]
-                    for future in concurrent.futures.as_completed(futures):
-                        results.append(future.result())
-
-                if sort_option == "Listing Sequence (Default)":
-                    results.sort(key=lambda x: x["#"])
-                elif sort_option == "Strategy Score (Highest to Lowest)":
-                    results.sort(key=lambda x: x["Setup Score / 100"], reverse=True)
-                elif sort_option == "Risk/Reward Ratio (Best R:R)":
-                    results.sort(key=lambda x: x["Risk/Reward (R:R)"], reverse=True)
-                elif sort_option == "Price (High to Low)":
-                    results.sort(key=lambda x: x["_raw_price"], reverse=True)
-                elif sort_option == "Price (Low to High)":
-                    results.sort(key=lambda x: x["_raw_price"])
-                elif sort_option == "Symbol Name (A-Z)":
-                    results.sort(key=lambda x: x["Symbol"])
-
-                for r in results:
-                    del r["_raw_price"]
-
-                df_s3 = pd.DataFrame(results)
-
-                st.success(
-                    f"Successfully processed {len(results)} assets with Risk & Liquidity Filters!"
+            def worker_s3(item: dict) -> dict | None:
+                symbol = item["symbol"]
+                bars = (
+                    []
+                    if item["is_hidden"] or not item["has_spot"]
+                    else get_candles(item["pair"], timeframe)
                 )
-                st.dataframe(
-                    df_s3,
-                    use_container_width=True,
-                    column_config={
-                        "Chart Link": st.column_config.LinkColumn(
-                            "Symbol Link", display_text="View Chart"
-                        )
-                    },
+                if not bars:
+                    return None
+                volume = estimate_24h_quote_volume(
+                    item["pair"], timeframe, bars
                 )
+                if volume < min_vol_filter:
+                    return None
+                result = calc_strategy_3(
+                    bars,
+                    volume,
+                    int(s3_left),
+                    int(s3_right),
+                    int(s3_fallback),
+                    int(s3_black_left),
+                    int(s3_black_right),
+                    int(s3_offset),
+                    min_vol_filter,
+                )
+                if result is None:
+                    return None
+                return {
+                    "#": item["listing_rank"],
+                    "Symbol": f"{symbol} ({item['full_name']})",
+                    "Chart": item["chart_url"],
+                    "Price": result["price"],
+                    "24H Vol (USDT)": volume,
+                    "Score": result["score"],
+                    "Status": result["status"],
+                    "Support": result["support"],
+                    "Resistance": result["resistance"],
+                    "Black Line": result["black_line"],
+                    "Stop Loss": result["stop_loss"],
+                    "Take Profit": result["take_profit"],
+                    "Risk %": result["risk_pct"],
+                    "TP %": result["tp_pct"],
+                    "R:R": result["rr"],
+                    "Liquidity": result["vol_status"],
+                    "_raw_price": result["price"],
+                    "_raw_rr": result["rr"],
+                    "_raw_sup_dist": (
+                        (result["price"] / result["support"] - 1.0) * 100.0
+                        if result["support"]
+                        else 999.0
+                    ),
+                    "_raw_symbol": symbol,
+                }
+
+            with st.spinner(
+                f"Scanning {len(assets)} assets on {timeframe}..."
+            ):
+                rows, skipped, failed = run_scan(
+                    worker_s3, assets, MAX_PARALLEL_REQUESTS
+                )
+
+            st.session_state["s3_result"] = {
+                "rows": rows,
+                "total": len(assets),
+                "skipped": skipped,
+                "failed": failed,
+                "timeframe": timeframe,
+            }
+
+    stored_s3 = st.session_state.get("s3_result")
+    if stored_s3:
+        key, reverse = sort_keys_s3[sort_s3]
+        sort_rows(stored_s3["rows"], key, reverse)
+        render_tab(
+            stored_s3["rows"],
+            stored_s3["total"],
+            stored_s3["skipped"],
+            stored_s3["failed"],
+            column_config={
+                "Chart": st.column_config.LinkColumn(
+                    "Chart", display_text="Open chart"
+                ),
+                "Price": st.column_config.NumberColumn(
+                    "Price (USDT)", format="$%.6f"
+                ),
+                "24H Vol (USDT)": st.column_config.NumberColumn(
+                    "24H Vol (USDT)", format="$%.0f"
+                ),
+                "Score": st.column_config.ProgressColumn(
+                    "Score / 100", min_value=0, max_value=100, format="%.1f"
+                ),
+                "Support": st.column_config.NumberColumn(
+                    "Support", format="$%.6f"
+                ),
+                "Resistance": st.column_config.NumberColumn(
+                    "Resistance", format="$%.6f"
+                ),
+                "Black Line": st.column_config.NumberColumn(
+                    "Black Line", format="$%.6f"
+                ),
+                "Stop Loss": st.column_config.NumberColumn(
+                    "Stop Loss", format="$%.6f"
+                ),
+                "Take Profit": st.column_config.NumberColumn(
+                    "Take Profit", format="$%.6f"
+                ),
+                "Risk %": st.column_config.NumberColumn(
+                    "Risk %", format="%.2f%%"
+                ),
+                "TP %": st.column_config.NumberColumn("TP %", format="%.2f%%"),
+                "R:R": st.column_config.NumberColumn(
+                    "Risk/Reward", format="%.2f"
+                ),
+            },
+            caption=(
+                "Stop loss = support x 0.985. Take profit = channel "
+                "resistance. R:R shows 0.00 when the target is below price "
+                "or the stop is above it, instead of a misleading number."
+            ),
+        )
+        st.caption(f"Last scan ran on the {stored_s3['timeframe']} timeframe.")
+
+st.caption(
+    "Data source: mexc.com public API. Signals are mechanical and can be "
+    "wrong; always do your own research."
+)
